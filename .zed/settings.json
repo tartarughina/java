@@ -1,0 +1,18 @@
+{
+  "lsp": {
+    "json-language-server": {
+      "settings": {
+        "json": {
+          "schemas": [
+            {
+              "fileMatch": [
+                "jdtls-initialization-options.json"
+              ],
+              "url": "./jdtls-initialization-options.schema.json"
+            }
+          ]
+        }
+      }
+    }
+  }
+}
