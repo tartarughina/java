@@ -185,3 +185,10 @@ pub fn get_gradle_bridge_path(
 
     None
 }
+
+pub fn is_bazel_enabled(configuration: &Option<Value>) -> bool {
+    configuration
+        .as_ref()
+        .and_then(|c| c.pointer("/bazel_support").and_then(|v| v.as_bool()))
+        .unwrap_or(false)
+}

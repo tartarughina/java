@@ -22,6 +22,8 @@ Install the extension via Zeds extension manager. It should work out of the box 
 
 - The option to let the extension automatically download a JDK can be enabled by setting `jdk_auto_download` to `true`. When enabled, the extension will download [Amazon Corretto](https://aws.amazon.com/corretto/) (an OpenJDK distribution) if no valid `java_home` is provided or if the specified one does not meet the minimum version requirement (Java 21). User-provided JDKs **always** take precedence.
 
+- **Bazel Support (Experimental)**: If your project uses [Bazel](https://bazel.build/) as a build system, you can enable experimental Bazel support by setting `bazel_support` to `true`. This downloads and injects the [Salesforce Bazel Eclipse](https://github.com/salesforce/bazel-eclipse) bundles into JDTLS. **Note:** This feature is currently experimental and has known limitations - see the [Bazel Support](#bazel-support-experimental) section below for details.
+
 Here is a common `settings.json` including the above mentioned configurations:
 
 ```jsonc
@@ -33,6 +35,7 @@ Here is a common `settings.json` including the above mentioned configurations:
       "java_home": "/path/to/your/JDK21+",
       "lombok_support": true,
       "jdk_auto_download": false,
+      "bazel_support": false,
 
       // JVM heap size for JDTLS (maps to -Xms and -Xmx)
       // Accepts values like "512m", "1G", "4096m", etc.
@@ -795,3 +798,43 @@ Then set the path settings to the remote paths and restart the language server:
   }
 }
 ```
+
+## Bazel Support (Experimental)
+
+Bazel support is currently **experimental** and has known limitations.
+
+### How it works
+
+When `bazel_support` is enabled, the extension downloads the [Salesforce Bazel Eclipse](https://github.com/salesforce/bazel-eclipse) plugin bundles and injects them into JDTLS via `initializationOptions.bundles`. This registers the `BazelProjectImporter` which can detect and import Bazel workspaces.
+
+### Current Limitations
+
+The Bazel Eclipse plugin was designed for VSCode and Eclipse IDE, which have special handling for Eclipse's linked resource mechanism. In standalone JDTLS (as used by Zed), the plugin successfully:
+- ✅ Loads and registers with JDTLS
+- ✅ Detects Bazel workspaces (WORKSPACE files)
+- ✅ Runs Bazel queries to discover targets
+- ✅ Creates project structures in `.eclipse/projects/`
+
+However, the linked source files mechanism doesn't work correctly, resulting in "not on classpath" errors for Java files.
+
+### Requirements (if testing)
+
+- Bazel must be installed and available on `$PATH`
+- Java files must have `package` declarations (default package not supported)
+- A `.bazelproject` file should exist in the workspace root
+
+### Alternative Approaches for Bazel Projects
+
+Until full Bazel support is available, consider these workarounds:
+
+1. **Generate classpath with Bazel aspects**: Use a custom Bazel aspect to generate a `classpath.txt` file, then configure jdtls manually. See [this blog post](https://fzakaria.com/2024/10/13/bazel-knowledge-aspects-to-generate-java-classpath) for an example implementation.
+
+2. **Generate Eclipse project files**: Use a script to query Bazel for dependencies and generate `.classpath` and `.project` files. JDTLS will then import the project as a standard Eclipse project.
+
+3. **Use VSCode**: The [Bazel VSCode Java extension](https://github.com/salesforce/bazel-vscode-java) works fully in VSCode with the RedHat Java extension.
+
+4. **Hybrid approach**: Use Bazel for building but maintain a parallel Maven/Gradle configuration for IDE support.
+
+### Contributing
+
+If you're interested in improving Bazel support, contributions are welcome! The main challenge is adapting the Bazel Eclipse plugin's linked resource mechanism to work with standalone JDTLS. See [GitHub issue #27](https://github.com/zed-extensions/java/issues/27) for discussion.

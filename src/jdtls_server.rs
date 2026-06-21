@@ -8,7 +8,8 @@ use zed_extension_api::{
 };
 
 use crate::{
-    config::{get_java_home, get_jdtls_launcher, is_lombok_enabled},
+    bazel::Bazel,
+    config::{get_java_home, get_jdtls_launcher, is_bazel_enabled, is_lombok_enabled},
     debugger::Debugger,
     downloadable::Downloadable,
     jdk::Jdk,
@@ -24,6 +25,7 @@ pub struct JdtlsServer {
     pub proxy: Proxy,
     pub jdk: Jdk,
     pub debugger: Debugger,
+    pub bazel: Bazel,
     pub cached_workspace: Option<String>,
 }
 
@@ -35,6 +37,7 @@ impl JdtlsServer {
             proxy: Proxy::new(),
             jdk: Jdk::new(),
             debugger: Debugger::new(),
+            bazel: Bazel::new(),
             cached_workspace: None,
         }
     }
@@ -117,6 +120,13 @@ impl LanguageServer for JdtlsServer {
             println!("Failed to download debugger: {err}");
         };
 
+        // download bazel bundles if enabled
+        if is_bazel_enabled(&configuration) {
+            if let Err(err) = self.bazel.get_or_download(language_server_id) {
+                println!("Failed to download Bazel bundles: {err}");
+            }
+        }
+
         self.cached_workspace = Some(worktree.root_path());
 
         Ok(zed::Command {
@@ -156,6 +166,14 @@ impl LanguageServer for JdtlsServer {
         caps_obj
             .entry("resolveAdditionalTextEditsSupport")
             .or_insert(json!(true));
+
+        // Inject Bazel bundles
+        if self.bazel.loaded() {
+            options = self
+                .bazel
+                .inject_bundles_into_options(Some(options))
+                .map_err(|err| format!("Failed to inject Bazel bundles into options: {err}"))?;
+        }
 
         if self.debugger.plugin_path().is_some() {
             return Ok(Some(

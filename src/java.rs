@@ -1,3 +1,4 @@
+mod bazel;
 mod config;
 mod debugger;
 mod downloadable;
