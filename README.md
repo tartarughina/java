@@ -57,7 +57,8 @@ Here is a common `settings.json` including the above mentioned configurations:
       "jdtls_launcher": "/path/to/your/jdt-language-server/bin/jdtls",
       "lombok_jar": "/path/to/your/lombok.jar",
       "java_debug_jar": "/path/to/your/com.microsoft.java.debug.plugin.jar",
-      "lsp_proxy_path": "/path/to/your/java-lsp-proxy"
+      "lsp_proxy_path": "/path/to/your/java-lsp-proxy",
+      "bazel_path": "/path/to/your/bazel-eclipse/plugins"
     }
   }
 }
@@ -806,6 +807,8 @@ Bazel support is currently **experimental** and has known limitations.
 ### How it works
 
 When `bazel_support` is enabled, the extension downloads the [Salesforce Bazel Eclipse](https://github.com/salesforce/bazel-eclipse) plugin bundles and injects them into JDTLS via `initializationOptions.bundles`. This registers the `BazelProjectImporter` which can detect and import Bazel workspaces.
+
+The downloaded bundles honor the `check_updates` setting like every other managed component. To use a locally built or extracted set of bundles instead of the managed download, set `bazel_path` to the directory containing them (either the install root or its `plugins/` subdirectory); when set, `check_updates` is ignored for the Bazel bundles.
 
 ### Current Limitations
 

@@ -121,10 +121,12 @@ impl LanguageServer for JdtlsServer {
         };
 
         // download bazel bundles if enabled
-        if is_bazel_enabled(&configuration) {
-            if let Err(err) = self.bazel.get_or_download(language_server_id) {
-                println!("Failed to download Bazel bundles: {err}");
-            }
+        if is_bazel_enabled(&configuration)
+            && let Err(err) =
+                self.bazel
+                    .get_or_download(language_server_id, &configuration, worktree)
+        {
+            println!("Failed to download Bazel bundles: {err}");
         }
 
         self.cached_workspace = Some(worktree.root_path());

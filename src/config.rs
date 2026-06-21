@@ -192,3 +192,20 @@ pub fn is_bazel_enabled(configuration: &Option<Value>) -> bool {
         .and_then(|c| c.pointer("/bazel_support").and_then(|v| v.as_bool()))
         .unwrap_or(false)
 }
+
+pub fn get_bazel_path(configuration: &Option<Value>, worktree: &Worktree) -> Option<String> {
+    if let Some(configuration) = configuration
+        && let Some(bazel_path) = configuration
+            .pointer("/bazel_path")
+            .and_then(|x| x.as_str())
+    {
+        match expand_home_path(worktree, bazel_path.to_string()) {
+            Ok(path) => return Some(path),
+            Err(err) => {
+                println!("{err}");
+            }
+        }
+    }
+
+    None
+}
