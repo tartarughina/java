@@ -22,7 +22,7 @@ Install the extension via Zeds extension manager. It should work out of the box 
 
 - The option to let the extension automatically download a JDK can be enabled by setting `jdk_auto_download` to `true`. When enabled, the extension will download [Amazon Corretto](https://aws.amazon.com/corretto/) (an OpenJDK distribution) if no valid `java_home` is provided or if the specified one does not meet the minimum version requirement (Java 21). User-provided JDKs **always** take precedence.
 
-- **Bazel Support (Experimental)**: If your project uses [Bazel](https://bazel.build/) as a build system, you can enable experimental Bazel support by setting `bazel_support` to `true`. This downloads and injects the [Salesforce Bazel Eclipse](https://github.com/salesforce/bazel-eclipse) bundles into JDTLS. **Note:** This feature is currently experimental and has known limitations - see the [Bazel Support](#bazel-support-experimental) section below for details.
+- **Bazel Support (Experimental)**: If your project uses [Bazel](https://bazel.build/) as a build system, you can enable experimental Bazel support by setting `bazel_support` to `true`. This downloads and injects the [Salesforce Bazel Eclipse](https://github.com/salesforce/bazel-eclipse) bundles into JDTLS. **Note:** This is experimental and currently has a significant unresolved limitation — Java files often report "not on the classpath" with only syntax-level support. The same issue affects the official VSCode extension. Read the [Bazel Support](#bazel-support-experimental) section before enabling it.
 
 Here is a common `settings.json` including the above mentioned configurations:
 
@@ -812,32 +812,38 @@ The downloaded bundles honor the `check_updates` setting like every other manage
 
 ### Current Limitations
 
-The Bazel Eclipse plugin was designed for VSCode and Eclipse IDE, which have special handling for Eclipse's linked resource mechanism. In standalone JDTLS (as used by Zed), the plugin successfully:
-- ✅ Loads and registers with JDTLS
-- ✅ Detects Bazel workspaces (WORKSPACE files)
-- ✅ Runs Bazel queries to discover targets
-- ✅ Creates project structures in `.eclipse/projects/`
+With the bundles registered, the plugin gets a long way:
+- ✅ Loads and registers with JDTLS (`BazelProjectImporter`)
+- ✅ Detects Bazel workspaces (`MODULE.bazel` / `WORKSPACE[.bazel]` / `REPO.bazel`)
+- ✅ Runs Bazel queries to discover targets and computes classpaths via the IntelliJ aspects
+- ✅ Provisions per-target projects under `.eclipse/projects/` with linked source folders
 
-However, the linked source files mechanism doesn't work correctly, resulting in "not on classpath" errors for Java files.
+But opening a Java file commonly reports:
+
+> `X.java is not on the classpath of project <workspace>, only syntax errors are reported`
+
+so completion, navigation, and diagnostics fall back to syntax-only.
+
+**Root cause (investigated).** The plugin imports the workspace root itself as an Eclipse "workspace project" rooted at the filesystem root, *in addition to* the per-target projects whose source folders are Eclipse *linked resources* under `.eclipse/projects/<target>/linked-srcs`. Each `.java` file therefore belongs to two projects at once: the workspace project (which has **no source classpath entry** — it exists for global search, not development) and the correct per-target project. When JDTLS resolves the opened file's on-disk path back to a project, the workspace project frequently wins, and because that project doesn't put the file on a classpath you get the error above. This is a limitation of the Bazel Eclipse plugin's linked-resource provisioning model under standalone JDTLS — it is **not** specific to Zed.
+
+**This is not solved by using VSCode.** The same plugin core powers the official [VSCode extension](https://github.com/salesforce/bazel-vscode-java), and the identical failure is reported there with no fix: see salesforce/bazel-vscode-java [#143](https://github.com/salesforce/bazel-vscode-java/issues/143) ("`.java` is not on the class path of project A, only syntax errors are reported") and [#169](https://github.com/salesforce/bazel-vscode-java/issues/169) (unresolved imports to generated code / Maven deps / other targets). Tuning `.bazelproject` (`directories`, `targets`, `derive_targets_from_directories`) or hand-editing `.classpath` does not reliably fix it in either client.
 
 ### Requirements (if testing)
 
 - Bazel must be installed and available on `$PATH`
 - Java files must have `package` declarations (default package not supported)
-- A `.bazelproject` file should exist in the workspace root
+- A `.bazelproject` file is read **only** from `<workspace>/.eclipse/.bazelproject` (a file at the workspace root is ignored). If it is missing, the plugin generates a default one containing `directories: .` ("import everything"), which makes the workspace project claim every source file and `BUILD.bazel` — scope it to your source directories instead.
 
 ### Alternative Approaches for Bazel Projects
 
-Until full Bazel support is available, consider these workarounds:
+Until the upstream limitation is resolved, consider these workarounds:
 
 1. **Generate classpath with Bazel aspects**: Use a custom Bazel aspect to generate a `classpath.txt` file, then configure jdtls manually. See [this blog post](https://fzakaria.com/2024/10/13/bazel-knowledge-aspects-to-generate-java-classpath) for an example implementation.
 
 2. **Generate Eclipse project files**: Use a script to query Bazel for dependencies and generate `.classpath` and `.project` files. JDTLS will then import the project as a standard Eclipse project.
 
-3. **Use VSCode**: The [Bazel VSCode Java extension](https://github.com/salesforce/bazel-vscode-java) works fully in VSCode with the RedHat Java extension.
-
-4. **Hybrid approach**: Use Bazel for building but maintain a parallel Maven/Gradle configuration for IDE support.
+3. **Hybrid approach**: Use Bazel for building but maintain a parallel Maven/Gradle configuration for IDE support.
 
 ### Contributing
 
-If you're interested in improving Bazel support, contributions are welcome! The main challenge is adapting the Bazel Eclipse plugin's linked resource mechanism to work with standalone JDTLS. See [GitHub issue #27](https://github.com/zed-extensions/java/issues/27) for discussion.
+If you're interested in improving Bazel support, contributions are welcome! The core obstacle lives upstream in the Bazel Eclipse plugin (the workspace-project/linked-resource provisioning described above), so the highest-leverage fixes are likely there rather than in this extension. See [GitHub issue #27](https://github.com/zed-extensions/java/issues/27) for discussion.
