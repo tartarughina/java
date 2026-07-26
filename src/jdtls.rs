@@ -362,10 +362,12 @@ fn download_jdtls_milestone(version: &str) -> zed::Result<String> {
     .map_err(|err| format!("Failed to get latest version's build (malformed response): {err}"))
 }
 
+/// Return the launcher path expected inside an extracted JDTLS installation.
 fn jdtls_binary_path(install_path: &Path, binary_name: &str) -> PathBuf {
     install_path.join("bin").join(binary_name)
 }
 
+/// Return the tag-specific installation path only when all required JDTLS files are present.
 fn installed_jdtls_version(
     prefix: &Path,
     version: &str,
@@ -376,6 +378,7 @@ fn installed_jdtls_version(
     is_complete_jdtls_install(&install_path, binary_name, config_directory).then_some(install_path)
 }
 
+/// Validate the launcher, platform configuration, and Equinox launcher needed to start JDTLS.
 fn is_complete_jdtls_install(
     install_path: &Path,
     binary_name: &str,
@@ -386,6 +389,8 @@ fn is_complete_jdtls_install(
         && find_equinox_launcher(install_path).is_ok()
 }
 
+/// Select an unused hidden sibling directory for extracting a JDTLS archive
+/// before it is promoted to the tag-specific installation directory.
 fn jdtls_staging_path(prefix: &Path, version: &str) -> zed::Result<PathBuf> {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -399,6 +404,10 @@ fn jdtls_staging_path(prefix: &Path, version: &str) -> zed::Result<PathBuf> {
         .ok_or_else(|| format!("Failed to allocate a JDTLS staging directory for {version}"))
 }
 
+/// Validate and atomically promote a staged JDTLS installation.
+///
+/// A concurrently completed installation wins; its redundant staging directory
+/// is removed instead of replacing the valid final directory.
 fn promote_staged_jdtls(
     staging_path: &Path,
     install_path: &Path,
@@ -434,6 +443,8 @@ fn promote_staged_jdtls(
     }
 }
 
+/// Remove older completed JDTLS version directories while preserving the
+/// selected version, update records, and hidden in-progress staging directories.
 fn remove_old_jdtls_installations(prefix: &Path, version: &str) -> zed::Result<()> {
     let entries = fs::read_dir(prefix)
         .map_err(|err| format!("Failed to read JDTLS install directory {prefix:?}: {err}"))?;
@@ -531,6 +542,7 @@ fn get_sha1_hex(input: &str) -> String {
     hex::encode(result)
 }
 
+/// Return the JDTLS configuration directory bundled for the current platform.
 fn get_shared_config_directory_name() -> &'static str {
     match current_platform() {
         (Os::Mac, Architecture::Aarch64) => "config_mac_arm",

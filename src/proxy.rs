@@ -37,10 +37,12 @@ impl Proxy {
         Ok(path.to_string_lossy().to_string())
     }
 
+    /// Find a development override or the proxy matching the extension release.
     fn find_local(&self) -> Option<PathBuf> {
         find_native_binary(&proxy_exec())
     }
 
+    /// Download and validate the proxy asset for the specified extension release.
     fn download(
         &mut self,
         version: &str,
@@ -85,6 +87,7 @@ impl Proxy {
         Ok(PathBuf::from(bin_path))
     }
 
+    /// Resolve an explicit override, reuse the extension-bound proxy, or download it.
     fn get_or_download(
         &mut self,
         language_server_id: &LanguageServerId,

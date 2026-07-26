@@ -29,10 +29,16 @@ pub trait Downloadable {
         worktree: &Worktree,
     ) -> zed::Result<PathBuf>;
 
+    /// Return this component's persistent update-check record path.
     fn update_check_path(&self) -> PathBuf {
         update_check_path(Self::INSTALL_PATH)
     }
 
+    /// Resolve the version to install, using a fresh cached version in `always`
+    /// mode or performing a remote version check when the cache cannot be used.
+    ///
+    /// The boolean indicates whether the version was retrieved remotely and
+    /// therefore needs to be recorded after installation succeeds.
     fn version_for_download(
         &self,
         language_server_id: &LanguageServerId,
@@ -57,6 +63,8 @@ pub trait Downloadable {
         version.map(|version| (version, true))
     }
 
+    /// Persist a successful remote version check without failing installation
+    /// when the record itself cannot be written.
     fn record_update_check(&self, version: &str) {
         if let Err(err) = record_successful_update_check(&self.update_check_path(), version) {
             println!(

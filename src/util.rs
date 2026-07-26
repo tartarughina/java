@@ -98,6 +98,8 @@ pub fn fresh_cached_version(update_check_path: &Path) -> Option<String> {
     fresh_cached_version_at(update_check_path, now)
 }
 
+/// Return a cached version relative to an explicit time, primarily to make TTL
+/// boundary behavior deterministic in tests.
 fn fresh_cached_version_at(update_check_path: &Path, now: u64) -> Option<String> {
     let record =
         serde_json::from_slice::<UpdateCheckRecord>(&fs::read(update_check_path).ok()?).ok()?;
@@ -110,6 +112,7 @@ fn fresh_cached_version_at(update_check_path: &Path, now: u64) -> Option<String>
     }
 }
 
+/// Atomically record the version and current time of a successful remote update check.
 pub fn record_successful_update_check(update_check_path: &Path, version: &str) -> zed::Result<()> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -118,6 +121,8 @@ pub fn record_successful_update_check(update_check_path: &Path, version: &str) -
     record_successful_update_check_at(update_check_path, version, now)
 }
 
+/// Serialize an update-check record using an explicit timestamp and replace the
+/// previous record through a temporary sibling file.
 fn record_successful_update_check_at(
     update_check_path: &Path,
     version: &str,
@@ -137,6 +142,7 @@ fn record_successful_update_check_at(
     replace_update_check_record(update_check_path, &contents, now)
 }
 
+/// Recognize the pre-JSON marker format, which stored only a non-empty version string.
 fn is_legacy_update_check_marker(contents: &[u8]) -> bool {
     let Ok(marker) = std::str::from_utf8(contents) else {
         return false;
@@ -145,6 +151,8 @@ fn is_legacy_update_check_marker(contents: &[u8]) -> bool {
     !marker.is_empty() && !marker.starts_with('{') && !marker.starts_with('[')
 }
 
+/// Write and sync a uniquely named temporary record before renaming it over the
+/// destination, preventing interrupted writes from leaving partial JSON.
 fn replace_update_check_record(
     update_check_path: &Path,
     contents: &[u8],
@@ -292,14 +300,17 @@ pub fn get_java_exec_name() -> String {
 /// `bin/<version>/`; root-level binaries are local development overrides.
 pub const NATIVE_BIN_DIR: &str = "bin";
 
+/// Return the release tag corresponding to the extension package version.
 pub fn extension_release_version() -> String {
     format!("v{}", env!("CARGO_PKG_VERSION"))
 }
 
+/// Find a native development override or the binary matching the current extension release.
 pub fn find_native_binary(executable: &str) -> Option<PathBuf> {
     find_native_binary_in(Path::new(NATIVE_BIN_DIR), executable)
 }
 
+/// Resolve a native binary within an explicit install directory for filesystem tests.
 fn find_native_binary_in(install_dir: &Path, executable: &str) -> Option<PathBuf> {
     let preferred_paths = [
         install_dir.join(executable),

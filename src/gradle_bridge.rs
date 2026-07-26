@@ -42,10 +42,12 @@ impl GradleBridge {
         Ok(path.to_string_lossy().to_string())
     }
 
+    /// Find a development override or the bridge matching the extension release.
     fn find_local(&self) -> Option<PathBuf> {
         find_native_binary(&bridge_exec())
     }
 
+    /// Download and validate the bridge asset for the specified extension release.
     fn download(
         &mut self,
         version: &str,
@@ -90,6 +92,7 @@ impl GradleBridge {
         Ok(PathBuf::from(bin_path))
     }
 
+    /// Resolve an explicit override, reuse the extension-bound bridge, or download it.
     fn get_or_download(
         &mut self,
         language_server_id: &LanguageServerId,
