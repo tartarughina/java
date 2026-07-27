@@ -81,15 +81,9 @@ pub fn update_check_path(component_name: &str) -> PathBuf {
     PathBuf::from(component_name).join(UPDATE_CHECK_MARKER)
 }
 
-/// Return whether a valid JSON record or non-empty legacy marker exists.
+/// Return whether an update-check marker exists, regardless of its format or contents.
 pub fn has_checked_once(update_check_path: &Path) -> bool {
-    let Ok(contents) = fs::read(update_check_path) else {
-        return false;
-    };
-
-    serde_json::from_slice::<UpdateCheckRecord>(&contents)
-        .is_ok_and(|record| !record.version.is_empty())
-        || is_legacy_update_check_marker(&contents)
+    update_check_path.exists()
 }
 
 /// Return the recorded version when its successful remote check is less than 24 hours old.
@@ -140,15 +134,6 @@ fn record_successful_update_check_at(
     let contents = serde_json::to_vec(&record)
         .map_err(|err| format!("Failed to serialize update-check record: {err}"))?;
     replace_update_check_record(update_check_path, &contents, now)
-}
-
-/// Recognize the pre-JSON marker format, which stored only a non-empty version string.
-fn is_legacy_update_check_marker(contents: &[u8]) -> bool {
-    let Ok(marker) = std::str::from_utf8(contents) else {
-        return false;
-    };
-    let marker = marker.trim();
-    !marker.is_empty() && !marker.starts_with('{') && !marker.starts_with('[')
 }
 
 /// Write and sync a uniquely named temporary record before renaming it over the
@@ -790,15 +775,17 @@ mod tests {
     }
 
     #[test]
-    fn malformed_update_check_record_does_not_count_for_once_mode() {
-        let path = temporary_update_check_path("malformed");
+    fn once_mode_uses_marker_presence_regardless_of_contents() {
+        let path = temporary_update_check_path("once-marker-contents");
         create_path_if_not_exists(path.parent().unwrap()).unwrap();
 
         fs::write(&path, r#"{"version":"1.2.3""#).unwrap();
-        assert!(!has_checked_once(&path));
+        assert!(has_checked_once(&path));
+        assert_eq!(fresh_cached_version_at(&path, 1_000), None);
 
         fs::write(&path, "").unwrap();
-        assert!(!has_checked_once(&path));
+        assert!(has_checked_once(&path));
+        assert_eq!(fresh_cached_version_at(&path, 1_000), None);
         remove_temporary_update_check(&path);
     }
 
