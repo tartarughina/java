@@ -37,8 +37,8 @@ pub trait Downloadable {
     /// Resolve the version to install, using a fresh cached version in `always`
     /// mode or performing a remote version check when the cache cannot be used.
     ///
-    /// The boolean indicates whether the version was retrieved remotely and
-    /// therefore needs to be recorded after installation succeeds.
+    /// The boolean indicates whether the update-check marker should be refreshed
+    /// after installation succeeds.
     fn version_for_download(
         &self,
         language_server_id: &LanguageServerId,
@@ -95,14 +95,14 @@ pub trait Downloadable {
 
         let downloaded = self
             .version_for_download(language_server_id, configuration, worktree)
-            .and_then(|(version, was_fetched)| {
+            .and_then(|(version, update_marker)| {
                 self.download(&version, language_server_id, worktree)
-                    .map(|path| (path, version, was_fetched))
+                    .map(|path| (path, version, update_marker))
             });
 
         match downloaded {
-            Ok((path, version, was_fetched)) => {
-                if was_fetched {
+            Ok((path, version, update_marker)) => {
+                if update_marker {
                     self.record_update_check(&version);
                 }
                 Ok(path)
