@@ -64,6 +64,10 @@ impl SuppressedResponses {
         self.ids.insert(id);
     }
 
+    fn contains(&self, id: &Value) -> bool {
+        self.ids.contains(id)
+    }
+
     fn take(&mut self, id: &Value) -> bool {
         self.ids.remove(id)
     }
@@ -168,6 +172,7 @@ fn main() {
         while alive_stdin.load(Ordering::Relaxed) {
             match reader.read_message() {
                 Ok(Some(raw)) => {
+                    let mut forward_to_jdtls = true;
                     let should_parse =
                         raw_has_id(&raw) || contains_subslice(&raw, b"$/cancelRequest");
                     if should_parse {
@@ -180,16 +185,19 @@ fn main() {
                         };
                         if msg.get("method").and_then(Value::as_str) == Some("$/cancelRequest") {
                             if let Some(id) = msg.pointer("/params/id") {
+                                let already_suppressed = suppressed_in.lock().unwrap().contains(id);
                                 let (tracked, active_token) =
                                     take_request_for_cancellation(&tracked_in, &active_in, id);
                                 if let Some(request) = tracked {
                                     clear_latest_workspace(&latest_workspace_in, request.token);
                                 }
+                                let handled_locally = active_token.is_some();
                                 if let Some(token) = active_token {
                                     clear_latest_workspace(&latest_workspace_in, token);
                                     decompile_in.cancel(token);
                                     output_in.send_value(&request_canceled(id));
                                 }
+                                forward_to_jdtls = !handled_locally && !already_suppressed;
                             }
                         } else if raw_has_id(&raw) {
                             let token = jobs_in.fetch_add(1, Ordering::Relaxed);
@@ -224,6 +232,9 @@ fn main() {
                                 }
                             }
                         }
+                    }
+                    if !forward_to_jdtls {
+                        continue;
                     }
                     let mut w = stdin_writer.lock().unwrap();
                     if w.write_all(&raw).is_err() || w.flush().is_err() {
@@ -726,7 +737,9 @@ mod tests {
             suppressed.insert(json!(id));
         }
 
+        assert!(suppressed.contains(&json!(0)));
         assert!(suppressed.take(&json!(0)));
+        assert!(!suppressed.contains(&json!(0)));
         assert!(suppressed.take(&json!(1024)));
     }
 
