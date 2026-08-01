@@ -16,7 +16,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const DECOMPILED_DIR: &str = "jdtls-decompiled";
+const DECOMPILED_DIR: &str = "jdtls_decompiled";
 const FETCH_WORKERS: usize = 2;
 const JOB_WORKERS: usize = 2;
 const MAX_QUEUED_JOBS: usize = 64;
@@ -687,7 +687,7 @@ fn session_cache_dir(scope: &str) -> PathBuf {
     let _ = fs::create_dir_all(&root);
     loop {
         let directory = root.join(format!(
-            "{scope}-{}-{started_at}-{sequence}",
+            "session_{scope}_{}_{started_at}_{sequence}",
             std::process::id()
         ));
         match fs::create_dir(&directory) {
@@ -716,18 +716,29 @@ fn cache_path_in(directory: &Path, uri: &str) -> PathBuf {
                 })
         })
         .unwrap_or("Decompiled");
-    let name: String = raw_name
+    let mut name: String = raw_name
         .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+        .enumerate()
+        .map(|(index, character)| {
+            let valid = if index == 0 {
+                character.is_ascii_alphabetic() || matches!(character, '_' | '$')
+            } else {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '$')
+            };
+            if valid {
                 character
             } else {
                 '_'
             }
         })
         .collect();
+    if name.is_empty() {
+        name.push_str("Decompiled");
+    }
 
-    directory.join(format!("{name}-{digest}.java"))
+    directory
+        .join(format!("uri_{digest}"))
+        .join(format!("{name}.java"))
 }
 
 fn write_cached_source(directory: &Path, uri: &str, content: &[u8]) -> Option<String> {
@@ -745,6 +756,12 @@ fn write_cached_source(directory: &Path, uri: &str, content: &[u8]) -> Option<St
     let target = cache_path_in(directory, uri);
     if target.is_file() {
         return Some(path_to_file_uri(&target));
+    }
+    if let Some(parent) = target.parent() {
+        if let Err(error) = fs::create_dir_all(parent) {
+            lsp_error!("[decompile] Failed to create {}: {error}", parent.display());
+            return None;
+        }
     }
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -1399,12 +1416,32 @@ mod tests {
         let second = cache_path_in(directory, "jdt://contents/a/../../Bad Name.class");
 
         assert_eq!(first, second);
+        assert_eq!(first.file_name().unwrap(), "Bad_Name.java");
+        assert_eq!(first.extension().unwrap(), "java");
         assert!(first
+            .parent()
+            .unwrap()
             .file_name()
             .unwrap()
             .to_string_lossy()
-            .starts_with("Bad_Name-"));
-        assert_eq!(first.extension().unwrap(), "java");
+            .starts_with("uri_"));
+    }
+
+    #[test]
+    fn cache_file_stems_are_valid_java_identifiers() {
+        let directory = Path::new("/tmp/cache");
+        let path = cache_path_in(directory, "jdt://contents/a/Products$Product$Request.class");
+        let stem = path.file_stem().unwrap().to_string_lossy();
+
+        assert_eq!(stem, "Products$Product$Request");
+        assert!(stem
+            .chars()
+            .enumerate()
+            .all(|(index, character)| if index == 0 {
+                character.is_ascii_alphabetic() || matches!(character, '_' | '$')
+            } else {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '$')
+            }));
     }
 
     #[test]
