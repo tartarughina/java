@@ -12,8 +12,8 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Condvar, Mutex,
     },
-    thread,
-    time::{Duration, Instant},
+    thread::{self, JoinHandle},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const DECOMPILED_DIR: &str = "jdtls-decompiled";
@@ -54,11 +54,19 @@ pub struct DecompileCoordinator {
 struct Inner {
     fetcher: Arc<dyn ClassContentFetcher>,
     owned_id_prefix: String,
+    cache_dir: PathBuf,
     request_counter: AtomicU64,
     max_bulk_jobs: usize,
     state: Mutex<State>,
     work_available: Condvar,
     state_changed: Condvar,
+    workers: Mutex<Vec<JoinHandle<()>>>,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.cache_dir);
+    }
 }
 
 #[derive(Default)]
@@ -69,7 +77,6 @@ struct State {
     interactive_jobs: VecDeque<RewriteJob>,
     bulk_jobs: VecDeque<RewriteJob>,
     canceled_jobs: HashSet<u64>,
-    latest_bulk_job: Option<u64>,
     bulk_jobs_active: usize,
     bulk_fetches: usize,
     shutdown: bool,
@@ -162,26 +169,33 @@ impl DecompileCoordinator {
         fetch_workers: usize,
         job_workers: usize,
     ) -> Self {
+        let cache_dir = session_cache_dir(&owned_id_prefix);
         let coordinator = Self {
             inner: Arc::new(Inner {
                 fetcher,
                 owned_id_prefix,
+                cache_dir,
                 request_counter: AtomicU64::new(1),
                 max_bulk_jobs: job_workers.saturating_sub(1).max(1),
                 state: Mutex::new(State::default()),
                 work_available: Condvar::new(),
                 state_changed: Condvar::new(),
+                workers: Mutex::new(Vec::new()),
             }),
         };
 
+        let mut workers = Vec::with_capacity(fetch_workers + job_workers + 1);
         for _ in 0..fetch_workers {
             let inner = Arc::clone(&coordinator.inner);
-            thread::spawn(move || fetch_worker(inner));
+            workers.push(thread::spawn(move || fetch_worker(inner)));
         }
         for _ in 0..job_workers {
             let inner = Arc::clone(&coordinator.inner);
-            thread::spawn(move || job_worker(inner));
+            workers.push(thread::spawn(move || job_worker(inner)));
         }
+        let inner = Arc::clone(&coordinator.inner);
+        workers.push(thread::spawn(move || deadline_worker(inner)));
+        *coordinator.inner.workers.lock().unwrap() = workers;
 
         coordinator
     }
@@ -196,11 +210,6 @@ impl DecompileCoordinator {
         }
 
         if job.priority == Priority::Bulk {
-            if let Some(previous) = state.latest_bulk_job.replace(job.token) {
-                if cancel_job_locked(&mut state, previous) {
-                    state.canceled_jobs.remove(&previous);
-                }
-            }
             state.bulk_jobs.push_back(job);
         } else {
             state.interactive_jobs.push_back(job);
@@ -215,7 +224,7 @@ impl DecompileCoordinator {
             if cancel_job_locked(&mut state, token) {
                 state.canceled_jobs.remove(&token);
             }
-            orphaned_request_ids(&state)
+            detach_orphaned_fetches(&mut state)
         };
         for request_id in request_ids {
             self.inner.fetcher.cancel(&request_id);
@@ -243,12 +252,34 @@ impl DecompileCoordinator {
     }
 
     pub fn shutdown(&self) {
-        let mut state = self.inner.state.lock().unwrap();
-        state.shutdown = true;
-        state.interactive_jobs.clear();
-        state.bulk_jobs.clear();
+        let queued = {
+            let mut state = self.inner.state.lock().unwrap();
+            if state.shutdown {
+                Vec::new()
+            } else {
+                state.shutdown = true;
+                let mut queued: Vec<_> = state.interactive_jobs.drain(..).collect();
+                queued.extend(state.bulk_jobs.drain(..));
+                queued
+            }
+        };
         self.inner.work_available.notify_all();
         self.inner.state_changed.notify_all();
+
+        for job in queued {
+            if !self.consume_cancellation(job.token) {
+                (job.complete)(job.message);
+            }
+        }
+
+        let workers = std::mem::take(&mut *self.inner.workers.lock().unwrap());
+        for worker in workers {
+            let _ = worker.join();
+        }
+    }
+
+    pub fn cleanup_cache(&self) {
+        let _ = fs::remove_dir_all(&self.inner.cache_dir);
     }
 }
 
@@ -265,16 +296,28 @@ fn cancel_job_locked(state: &mut State, token: u64) -> bool {
     queued_jobs != state.interactive_jobs.len() + state.bulk_jobs.len()
 }
 
-fn orphaned_request_ids(state: &State) -> Vec<Value> {
-    state
+fn detach_orphaned_fetches(state: &mut State) -> Vec<Value> {
+    let now = Instant::now();
+    let orphaned: Vec<_> = state
         .uris
-        .values()
-        .filter(|entry| entry.waiters.is_empty())
-        .filter_map(|entry| match &entry.status {
-            UriStatus::InFlight { request_id, .. } => Some(request_id.clone()),
-            _ => None,
+        .iter()
+        .filter(|(_, entry)| entry.waiters.is_empty())
+        .filter(|(_, entry)| {
+            !matches!(entry.status, UriStatus::Failed(retry_after) if retry_after > now)
         })
-        .collect()
+        .map(|(uri, _)| uri.clone())
+        .collect();
+    let mut request_ids = Vec::new();
+    for uri in orphaned {
+        if let Some(UriEntry {
+            status: UriStatus::InFlight { request_id },
+            ..
+        }) = state.uris.remove(&uri)
+        {
+            request_ids.push(request_id);
+        }
+    }
+    request_ids
 }
 
 fn job_worker(inner: Arc<Inner>) {
@@ -304,20 +347,73 @@ fn job_worker(inner: Arc<Inner>) {
         }
 
         let mut message = job.message;
-        rewrite_message(
-            &inner,
-            job.token,
-            &mut message,
-            job.mode,
-            job.priority,
-            job.deadline,
-        );
+        if Instant::now() < job.deadline {
+            rewrite_message(
+                &inner,
+                job.token,
+                &mut message,
+                job.mode,
+                job.priority,
+                job.deadline,
+            );
+        }
         let canceled = is_canceled(&inner, job.token);
         finish_job(&inner, job.token, job.priority);
         if !canceled {
             (job.complete)(message);
         }
     }
+}
+
+fn deadline_worker(inner: Arc<Inner>) {
+    loop {
+        let expired = {
+            let mut state = inner.state.lock().unwrap();
+            loop {
+                if state.shutdown {
+                    return;
+                }
+
+                let now = Instant::now();
+                let mut expired = take_expired_jobs(&mut state.interactive_jobs, now);
+                expired.extend(take_expired_jobs(&mut state.bulk_jobs, now));
+                if !expired.is_empty() {
+                    break expired;
+                }
+
+                let next_deadline = state
+                    .interactive_jobs
+                    .iter()
+                    .chain(state.bulk_jobs.iter())
+                    .map(|job| job.deadline)
+                    .min();
+                state = if let Some(deadline) = next_deadline {
+                    let timeout = deadline.saturating_duration_since(Instant::now());
+                    inner.work_available.wait_timeout(state, timeout).unwrap().0
+                } else {
+                    inner.work_available.wait(state).unwrap()
+                };
+            }
+        };
+
+        for job in expired {
+            (job.complete)(job.message);
+        }
+    }
+}
+
+fn take_expired_jobs(queue: &mut VecDeque<RewriteJob>, now: Instant) -> Vec<RewriteJob> {
+    let mut expired = Vec::new();
+    let queued = queue.len();
+    for _ in 0..queued {
+        let job = queue.pop_front().unwrap();
+        if job.deadline <= now {
+            expired.push(job);
+        } else {
+            queue.push_back(job);
+        }
+    }
+    expired
 }
 
 fn is_canceled(inner: &Inner, token: u64) -> bool {
@@ -330,9 +426,6 @@ fn finish_job(inner: &Inner, token: u64, priority: Priority) {
         state.bulk_jobs_active = state.bulk_jobs_active.saturating_sub(1);
     }
     state.canceled_jobs.remove(&token);
-    if state.latest_bulk_job == Some(token) {
-        state.latest_bulk_job = None;
-    }
     for entry in state.uris.values_mut() {
         entry.waiters.remove(&token);
     }
@@ -386,7 +479,7 @@ fn resolve_uris(
     let mut unresolved = Vec::new();
 
     for uri in uris {
-        let path = cache_path(uri);
+        let path = cache_path_in(&inner.cache_dir, uri);
         if path.is_file() {
             replacements.insert(uri.clone(), path_to_file_uri(&path));
         } else {
@@ -457,7 +550,11 @@ fn resolve_uris(
             }
         }
 
-        if !waiting || state.canceled_jobs.contains(&token) || Instant::now() >= deadline {
+        if !waiting
+            || state.shutdown
+            || state.canceled_jobs.contains(&token)
+            || Instant::now() >= deadline
+        {
             break;
         }
 
@@ -471,7 +568,7 @@ fn resolve_uris(
             entry.waiters.remove(&token);
         }
     }
-    let orphaned = orphaned_request_ids(&state);
+    let orphaned = detach_orphaned_fetches(&mut state);
     drop(state);
     for request_id in orphaned {
         inner.fetcher.cancel(&request_id);
@@ -494,7 +591,8 @@ fn fetch_worker(inner: Arc<Inner>) {
         };
 
         let content = inner.fetcher.fetch(&uri, request_id.clone());
-        let resolved = content.and_then(|content| write_cached_source(&uri, content.as_bytes()));
+        let resolved = content
+            .and_then(|content| write_cached_source(&inner.cache_dir, &uri, content.as_bytes()));
 
         let mut state = inner.state.lock().unwrap();
         if priority == Priority::Bulk {
@@ -577,12 +675,29 @@ fn pop_valid_uri(state: &mut State, priority: Priority) -> Option<(String, Prior
     None
 }
 
-fn cache_dir() -> PathBuf {
-    env::temp_dir().join(DECOMPILED_DIR)
-}
-
-fn cache_path(uri: &str) -> PathBuf {
-    cache_path_in(&cache_dir(), uri)
+fn session_cache_dir(scope: &str) -> PathBuf {
+    static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
+    let mut sequence = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let scope = hex::encode(Sha1::digest(scope.as_bytes()));
+    let started_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let root = env::temp_dir().join(DECOMPILED_DIR);
+    let _ = fs::create_dir_all(&root);
+    loop {
+        let directory = root.join(format!(
+            "{scope}-{}-{started_at}-{sequence}",
+            std::process::id()
+        ));
+        match fs::create_dir(&directory) {
+            Ok(()) => return directory,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                sequence = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(_) => return directory,
+        }
+    }
 }
 
 fn cache_path_in(directory: &Path, uri: &str) -> PathBuf {
@@ -615,20 +730,19 @@ fn cache_path_in(directory: &Path, uri: &str) -> PathBuf {
     directory.join(format!("{name}-{digest}.java"))
 }
 
-fn write_cached_source(uri: &str, content: &[u8]) -> Option<String> {
+fn write_cached_source(directory: &Path, uri: &str, content: &[u8]) -> Option<String> {
     if content.is_empty() {
         return None;
     }
 
-    let directory = cache_dir();
-    if let Err(error) = fs::create_dir_all(&directory) {
+    if let Err(error) = fs::create_dir_all(directory) {
         lsp_error!(
             "[decompile] Failed to create {}: {error}",
             directory.display()
         );
         return None;
     }
-    let target = cache_path_in(&directory, uri);
+    let target = cache_path_in(directory, uri);
     if target.is_file() {
         return Some(path_to_file_uri(&target));
     }
@@ -717,11 +831,25 @@ fn replace_jdt_location_uris(value: &mut Value, replacements: &HashMap<String, S
 }
 
 fn jdt_uri_end(value: &str) -> usize {
-    value
-        .find(|character: char| {
-            character.is_whitespace() || matches!(character, ')' | ']' | '"' | '>' | '`' | '\'')
-        })
-        .unwrap_or(value.len())
+    if let Some(class_end) = value.find(".class") {
+        let class_end = class_end + ".class".len();
+        if value[class_end..].starts_with('?') {
+            return value[class_end..]
+                .find(is_jdt_uri_terminator)
+                .map(|query_end| class_end + query_end)
+                .unwrap_or(value.len());
+        }
+        return class_end;
+    }
+    value.find(is_jdt_uri_terminator).unwrap_or(value.len())
+}
+
+fn is_jdt_uri_terminator(character: char) -> bool {
+    character.is_whitespace()
+        || matches!(
+            character,
+            ')' | ']' | '}' | '"' | '>' | '`' | '\'' | ',' | ';'
+        )
 }
 
 fn collect_jdt_uris(value: &Value, uris: &mut Vec<String>, seen: &mut HashSet<String>) {
@@ -778,7 +906,10 @@ fn replace_in_strings(value: &mut Value, replacements: &HashMap<String, String>)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    };
 
     struct FakeFetcher {
         calls: AtomicUsize,
@@ -846,6 +977,10 @@ mod tests {
         )
     }
 
+    fn cached_path(coordinator: &DecompileCoordinator, uri: &str) -> PathBuf {
+        cache_path_in(&coordinator.inner.cache_dir, uri)
+    }
+
     #[test]
     fn rewrites_nested_workspace_symbol_locations() {
         let mut result = json!([
@@ -903,12 +1038,34 @@ mod tests {
     }
 
     #[test]
+    fn embedded_uri_extraction_stops_before_sentence_punctuation() {
+        let uri = "jdt://contents/java.base/java.lang/String.class";
+        let result = json!(format!("See {uri}, then java.lang.Object;"));
+        let mut uris = Vec::new();
+
+        collect_jdt_uris(&result, &mut uris, &mut HashSet::new());
+
+        assert_eq!(uris, vec![uri]);
+    }
+
+    #[test]
+    fn embedded_uri_extraction_preserves_query_components() {
+        let uri = "jdt://contents/java.base/java.lang/String.class?=java.base/String";
+        let result = json!(format!("See {uri}, then continue."));
+        let mut uris = Vec::new();
+
+        collect_jdt_uris(&result, &mut uris, &mut HashSet::new());
+
+        assert_eq!(uris, vec![uri]);
+    }
+
+    #[test]
     fn concurrent_waiters_share_one_fetch() {
         let fetcher = Arc::new(FakeFetcher::new(Duration::from_millis(20)));
         let coordinator =
             DecompileCoordinator::with_fetcher(fetcher.clone(), "test-".to_string(), 2, 0);
         let uri = unique_uri("single-flight");
-        let _ = fs::remove_file(cache_path(&uri));
+        let _ = fs::remove_file(cached_path(&coordinator, &uri));
 
         let first = {
             let coordinator = coordinator.clone();
@@ -924,7 +1081,7 @@ mod tests {
         assert_eq!(first.join().unwrap().len(), 1);
         assert_eq!(second.join().unwrap().len(), 1);
         assert_eq!(fetcher.calls.load(Ordering::Relaxed), 1);
-        let _ = fs::remove_file(cache_path(&uri));
+        let _ = fs::remove_file(cached_path(&coordinator, &uri));
         coordinator.shutdown();
     }
 
@@ -937,7 +1094,7 @@ mod tests {
             .map(|index| unique_uri(&format!("parallel-{index}")))
             .collect();
         for uri in &uris {
-            let _ = fs::remove_file(cache_path(uri));
+            let _ = fs::remove_file(cached_path(&coordinator, uri));
         }
 
         assert_eq!(
@@ -946,7 +1103,7 @@ mod tests {
         );
         assert_eq!(fetcher.max_active.load(Ordering::SeqCst), 2);
         for uri in &uris {
-            let _ = fs::remove_file(cache_path(uri));
+            let _ = fs::remove_file(cached_path(&coordinator, uri));
         }
         coordinator.shutdown();
     }
@@ -957,7 +1114,7 @@ mod tests {
         let coordinator = DecompileCoordinator::with_fetcher(fetcher, "test-".to_string(), 1, 0);
         let uris = vec![unique_uri("deadline-a"), unique_uri("deadline-b")];
         for uri in &uris {
-            let _ = fs::remove_file(cache_path(uri));
+            let _ = fs::remove_file(cached_path(&coordinator, uri));
         }
 
         let replacements = resolve_uris(
@@ -970,8 +1127,56 @@ mod tests {
 
         assert_eq!(replacements.len(), 1);
         for uri in &uris {
-            let _ = fs::remove_file(cache_path(uri));
+            let _ = fs::remove_file(cached_path(&coordinator, uri));
         }
+        coordinator.shutdown();
+    }
+
+    #[test]
+    fn queued_jobs_complete_when_their_deadline_expires() {
+        let fetcher = Arc::new(FakeFetcher::new(Duration::from_millis(150)));
+        let coordinator =
+            DecompileCoordinator::with_fetcher(fetcher.clone(), "deadline-".to_string(), 1, 1);
+        let first_uri = unique_uri("blocking-job");
+        let second_uri = unique_uri("queued-deadline");
+        let (first_tx, _first_rx) = mpsc::channel();
+        assert!(coordinator
+            .submit(RewriteJob {
+                token: 1,
+                message: json!({ "result": [{ "uri": first_uri }] }),
+                mode: RewriteMode::Locations,
+                priority: Priority::Interactive,
+                deadline: Instant::now() + Duration::from_secs(1),
+                complete: Box::new(move |message| {
+                    let _ = first_tx.send(message);
+                }),
+            })
+            .is_ok());
+        let worker_start_deadline = Instant::now() + Duration::from_secs(1);
+        while fetcher.active.load(Ordering::SeqCst) == 0 && Instant::now() < worker_start_deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(fetcher.active.load(Ordering::SeqCst), 1);
+
+        let original = json!({ "result": [{ "uri": second_uri }] });
+        let (second_tx, second_rx) = mpsc::channel();
+        assert!(coordinator
+            .submit(RewriteJob {
+                token: 2,
+                message: original.clone(),
+                mode: RewriteMode::Locations,
+                priority: Priority::Interactive,
+                deadline: Instant::now() + Duration::from_millis(20),
+                complete: Box::new(move |message| {
+                    let _ = second_tx.send(message);
+                }),
+            })
+            .is_ok());
+
+        assert_eq!(
+            second_rx.recv_timeout(Duration::from_millis(500)).unwrap(),
+            original
+        );
         coordinator.shutdown();
     }
 
@@ -981,7 +1186,7 @@ mod tests {
         let coordinator =
             DecompileCoordinator::with_fetcher(fetcher.clone(), "test-".to_string(), 1, 0);
         let uri = unique_uri("shared-cancel");
-        let _ = fs::remove_file(cache_path(&uri));
+        let _ = fs::remove_file(cached_path(&coordinator, &uri));
 
         let first = {
             let coordinator = coordinator.clone();
@@ -1007,7 +1212,36 @@ mod tests {
         assert!(first.join().unwrap().is_empty());
         assert_eq!(second.join().unwrap().len(), 1);
         assert_eq!(fetcher.cancellations.load(Ordering::Relaxed), 0);
-        let _ = fs::remove_file(cache_path(&uri));
+        let _ = fs::remove_file(cached_path(&coordinator, &uri));
+        coordinator.shutdown();
+    }
+
+    #[test]
+    fn timed_out_fetch_does_not_poison_immediate_retry() {
+        let fetcher = Arc::new(FakeFetcher::new(Duration::from_millis(60)));
+        let coordinator =
+            DecompileCoordinator::with_fetcher(fetcher.clone(), "retry-".to_string(), 2, 0);
+        let uri = unique_uri("retry-after-timeout");
+
+        let first = resolve_uris(
+            &coordinator.inner,
+            1,
+            std::slice::from_ref(&uri),
+            Priority::Interactive,
+            Instant::now() + Duration::from_millis(10),
+        );
+        let second = resolve_uris(
+            &coordinator.inner,
+            2,
+            std::slice::from_ref(&uri),
+            Priority::Interactive,
+            Instant::now() + Duration::from_millis(250),
+        );
+
+        assert!(first.is_empty());
+        assert_eq!(second.len(), 1);
+        assert_eq!(fetcher.calls.load(Ordering::Relaxed), 2);
+        assert_eq!(fetcher.cancellations.load(Ordering::Relaxed), 1);
         coordinator.shutdown();
     }
 
@@ -1017,7 +1251,7 @@ mod tests {
         let coordinator =
             DecompileCoordinator::with_fetcher(fetcher.clone(), "test-".to_string(), 1, 0);
         let uri = unique_uri("negative-cache");
-        let _ = fs::remove_file(cache_path(&uri));
+        let _ = fs::remove_file(cached_path(&coordinator, &uri));
 
         assert!(rewrite_for_test(
             &coordinator,
@@ -1038,9 +1272,102 @@ mod tests {
     }
 
     #[test]
+    fn coordinators_do_not_share_cache_across_server_sessions() {
+        let uri = unique_uri("session-cache");
+        let first_fetcher = Arc::new(FakeFetcher::new(Duration::ZERO));
+        let first = DecompileCoordinator::with_fetcher(
+            first_fetcher.clone(),
+            "same-server-scope-".to_string(),
+            1,
+            0,
+        );
+        assert_eq!(
+            rewrite_for_test(&first, 1, std::slice::from_ref(&uri), Priority::Interactive).len(),
+            1
+        );
+        let first_cache = first.inner.cache_dir.clone();
+        first.shutdown();
+        first.cleanup_cache();
+        assert!(!first_cache.exists());
+
+        let second_fetcher = Arc::new(FakeFetcher::new(Duration::ZERO));
+        let second = DecompileCoordinator::with_fetcher(
+            second_fetcher.clone(),
+            "same-server-scope-".to_string(),
+            1,
+            0,
+        );
+        assert_ne!(first_cache, second.inner.cache_dir);
+        assert_eq!(
+            rewrite_for_test(
+                &second,
+                2,
+                std::slice::from_ref(&uri),
+                Priority::Interactive
+            )
+            .len(),
+            1
+        );
+        assert_eq!(second_fetcher.calls.load(Ordering::Relaxed), 1);
+        second.shutdown();
+        second.cleanup_cache();
+    }
+
+    #[test]
+    fn canceling_a_queued_bulk_job_retires_all_state() {
+        let fetcher = Arc::new(FakeFetcher::new(Duration::ZERO));
+        let coordinator =
+            DecompileCoordinator::with_fetcher(fetcher, "queued-cancel-".to_string(), 0, 0);
+        assert!(coordinator
+            .submit(RewriteJob {
+                token: 7,
+                message: json!({ "result": [] }),
+                mode: RewriteMode::Locations,
+                priority: Priority::Bulk,
+                deadline: Instant::now() + Duration::from_secs(1),
+                complete: Box::new(|_| {}),
+            })
+            .is_ok());
+
+        coordinator.cancel(7);
+
+        let state = coordinator.inner.state.lock().unwrap();
+        assert!(!state.canceled_jobs.contains(&7));
+        assert!(state.bulk_jobs.is_empty());
+        drop(state);
+        coordinator.shutdown();
+    }
+
+    #[test]
+    fn shutdown_completes_queued_jobs_unchanged() {
+        let fetcher = Arc::new(FakeFetcher::new(Duration::ZERO));
+        let coordinator =
+            DecompileCoordinator::with_fetcher(fetcher, "shutdown-".to_string(), 0, 0);
+        let original = json!({ "result": [{ "uri": "jdt://contents/test/A.class" }] });
+        let (sender, receiver) = mpsc::channel();
+        assert!(coordinator
+            .submit(RewriteJob {
+                token: 8,
+                message: original.clone(),
+                mode: RewriteMode::Locations,
+                priority: Priority::Interactive,
+                deadline: Instant::now() + Duration::from_secs(1),
+                complete: Box::new(move |message| {
+                    let _ = sender.send(message);
+                }),
+            })
+            .is_ok());
+
+        coordinator.shutdown();
+
+        assert_eq!(receiver.recv().unwrap(), original);
+    }
+
+    #[test]
     fn competing_cache_writes_never_expose_partial_content() {
         let uri = unique_uri("atomic-cache");
-        let path = cache_path(&uri);
+        let directory = session_cache_dir("atomic-cache-test");
+        let path = cache_path_in(&directory, &uri);
         let _ = fs::remove_file(&path);
         let first_content = vec![b'a'; 32 * 1024];
         let second_content = vec![b'b'; 32 * 1024];
@@ -1048,12 +1375,14 @@ mod tests {
         let first = {
             let uri = uri.clone();
             let content = first_content.clone();
-            thread::spawn(move || write_cached_source(&uri, &content))
+            let directory = directory.clone();
+            thread::spawn(move || write_cached_source(&directory, &uri, &content))
         };
         let second = {
             let uri = uri.clone();
             let content = second_content.clone();
-            thread::spawn(move || write_cached_source(&uri, &content))
+            let directory = directory.clone();
+            thread::spawn(move || write_cached_source(&directory, &uri, &content))
         };
         assert!(first.join().unwrap().is_some());
         assert!(second.join().unwrap().is_some());
@@ -1081,10 +1410,11 @@ mod tests {
     #[test]
     fn empty_sources_are_not_cached() {
         let uri = unique_uri("empty");
-        let path = cache_path(&uri);
+        let directory = session_cache_dir("empty-cache-test");
+        let path = cache_path_in(&directory, &uri);
         let _ = fs::remove_file(&path);
 
-        assert_eq!(write_cached_source(&uri, b""), None);
+        assert_eq!(write_cached_source(&directory, &uri, b""), None);
         assert!(!path.exists());
     }
 }

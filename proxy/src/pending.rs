@@ -1,30 +1,37 @@
 use serde_json::Value;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{mpsc, Mutex},
 };
 
 pub struct PendingResponses {
-    owned_id_prefix: String,
-    pending: Mutex<HashMap<Value, mpsc::Sender<Value>>>,
+    state: Mutex<State>,
+}
+
+#[derive(Default)]
+struct State {
+    pending: HashMap<Value, mpsc::Sender<Value>>,
+    owned: HashSet<Value>,
 }
 
 impl PendingResponses {
-    pub fn new(owned_id_prefix: String) -> Self {
+    pub fn new() -> Self {
         Self {
-            owned_id_prefix,
-            pending: Mutex::new(HashMap::new()),
+            state: Mutex::new(State::default()),
         }
     }
 
     pub fn register(&self, id: Value) -> mpsc::Receiver<Value> {
         let (sender, receiver) = mpsc::channel();
-        self.pending.lock().unwrap().insert(id, sender);
+        let mut state = self.state.lock().unwrap();
+        state.owned.insert(id.clone());
+        state.pending.insert(id, sender);
         receiver
     }
 
     pub fn remove(&self, id: &Value) {
-        self.pending.lock().unwrap().remove(id);
+        let mut state = self.state.lock().unwrap();
+        state.pending.remove(id);
     }
 
     /// Returns true when the response belongs to the proxy and must not be
@@ -37,18 +44,26 @@ impl PendingResponses {
             return false;
         };
 
-        let sender = self.pending.lock().unwrap().remove(id);
+        let sender = {
+            let mut state = self.state.lock().unwrap();
+            let sender = state.pending.remove(id);
+            if sender.is_none() && state.owned.contains(id) {
+                return true;
+            }
+            sender
+        };
         if let Some(sender) = sender {
             let _ = sender.send(message.clone());
             return true;
         }
 
-        id.as_str()
-            .is_some_and(|id| id.starts_with(&self.owned_id_prefix))
+        false
     }
 
     pub fn clear(&self) {
-        self.pending.lock().unwrap().clear();
+        let mut state = self.state.lock().unwrap();
+        state.pending.clear();
+        state.owned.clear();
     }
 }
 
@@ -59,7 +74,7 @@ mod tests {
 
     #[test]
     fn routes_each_pending_response_once() {
-        let pending = PendingResponses::new("proxy-owned-".to_string());
+        let pending = PendingResponses::new();
         let id = json!("proxy-owned-1");
         let receiver = pending.register(id.clone());
         let response = json!({ "jsonrpc": "2.0", "id": id, "result": "ok" });
@@ -71,7 +86,10 @@ mod tests {
 
     #[test]
     fn swallows_late_owned_responses_but_not_client_responses() {
-        let pending = PendingResponses::new("proxy-owned-".to_string());
+        let pending = PendingResponses::new();
+        let retired = json!("proxy-owned-late");
+        pending.register(retired.clone());
+        pending.remove(&retired);
 
         assert!(pending.route(&json!({
             "jsonrpc": "2.0",
@@ -88,6 +106,33 @@ mod tests {
             "id": "proxy-owned-server-request",
             "method": "workspace/applyEdit",
             "params": {}
+        })));
+    }
+
+    #[test]
+    fn does_not_claim_unregistered_prefixed_ids() {
+        let pending = PendingResponses::new();
+
+        assert!(!pending.route(&json!({
+            "jsonrpc": "2.0",
+            "id": "proxy-owned-editor-request",
+            "result": null
+        })));
+    }
+
+    #[test]
+    fn ownership_is_retained_for_the_entire_session() {
+        let pending = PendingResponses::new();
+        for id in 0..=1024 {
+            let id = json!(format!("proxy-owned-{id}"));
+            pending.register(id.clone());
+            pending.remove(&id);
+        }
+
+        assert!(pending.route(&json!({
+            "jsonrpc": "2.0",
+            "id": "proxy-owned-0",
+            "result": null
         })));
     }
 }

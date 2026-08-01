@@ -4,15 +4,29 @@ use std::{
     io::{self, Write},
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc,
+        mpsc, Arc, Mutex,
     },
-    thread,
+    thread::{self, JoinHandle},
+    time::Duration,
 };
+
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Clone)]
 pub struct Output {
-    sender: mpsc::Sender<Vec<u8>>,
+    inner: Arc<Inner>,
+}
+
+struct Inner {
+    sender: Mutex<Option<mpsc::Sender<Message>>>,
+    worker: Mutex<Option<JoinHandle<()>>>,
+    done: Mutex<Option<mpsc::Receiver<()>>>,
     failed: Arc<AtomicBool>,
+}
+
+enum Message {
+    Frame(Vec<u8>),
+    Shutdown,
 }
 
 impl Output {
@@ -22,16 +36,33 @@ impl Output {
 
     fn start_with_writer(writer: impl Write + Send + 'static) -> Self {
         let (sender, receiver) = mpsc::channel();
+        let (done_sender, done) = mpsc::channel();
         let failed = Arc::new(AtomicBool::new(false));
         let writer_failed = Arc::clone(&failed);
-        thread::spawn(move || write_loop(writer, receiver, writer_failed));
-        Self { sender, failed }
+        let worker = thread::spawn(move || {
+            write_loop(writer, receiver, writer_failed);
+            let _ = done_sender.send(());
+        });
+        Self {
+            inner: Arc::new(Inner {
+                sender: Mutex::new(Some(sender)),
+                worker: Mutex::new(Some(worker)),
+                done: Mutex::new(Some(done)),
+                failed,
+            }),
+        }
     }
 
     pub fn send_raw(&self, raw: Vec<u8>) -> bool {
-        let sent = self.sender.send(raw).is_ok();
+        let sent = self
+            .inner
+            .sender
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|sender| sender.send(Message::Frame(raw)).is_ok());
         if !sent {
-            self.failed.store(true, Ordering::Relaxed);
+            self.inner.failed.store(true, Ordering::Relaxed);
         }
         sent
     }
@@ -41,15 +72,40 @@ impl Output {
     }
 
     pub fn failed(&self) -> bool {
-        self.failed.load(Ordering::Relaxed)
+        self.inner.failed.load(Ordering::Relaxed)
+    }
+
+    /// Stops accepting frames and gives stdout a bounded interval to drain.
+    /// A blocked editor must not prevent the proxy process from terminating.
+    pub fn shutdown(&self) {
+        if let Some(sender) = self.inner.sender.lock().unwrap().take() {
+            let _ = sender.send(Message::Shutdown);
+        }
+        let drained = self
+            .inner
+            .done
+            .lock()
+            .unwrap()
+            .take()
+            .is_none_or(|done| done.recv_timeout(SHUTDOWN_DRAIN_TIMEOUT).is_ok());
+        if let Some(worker) = self.inner.worker.lock().unwrap().take() {
+            if drained {
+                let _ = worker.join();
+            }
+        }
     }
 }
 
-fn write_loop(mut writer: impl Write, receiver: mpsc::Receiver<Vec<u8>>, failed: Arc<AtomicBool>) {
+fn write_loop(mut writer: impl Write, receiver: mpsc::Receiver<Message>, failed: Arc<AtomicBool>) {
     while let Ok(message) = receiver.recv() {
-        if writer.write_all(&message).is_err() || writer.flush().is_err() {
-            failed.store(true, Ordering::Relaxed);
-            break;
+        match message {
+            Message::Frame(frame) => {
+                if writer.write_all(&frame).is_err() || writer.flush().is_err() {
+                    failed.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
+            Message::Shutdown => break,
         }
     }
 }
@@ -85,6 +141,23 @@ mod tests {
         }
     }
 
+    struct BlockingWriter {
+        started: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    }
+
+    impl Write for BlockingWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let _ = self.started.send(());
+            let _ = self.release.recv();
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn serializes_complete_frames_in_submission_order() {
         let writer = SharedWriter::default();
@@ -93,16 +166,10 @@ mod tests {
 
         assert!(output.send_raw(b"first".to_vec()));
         assert!(output.send_raw(b"second".to_vec()));
-        drop(output);
-
-        for _ in 0..100 {
-            if bytes.lock().unwrap().len() == 11 {
-                break;
-            }
-            thread::sleep(std::time::Duration::from_millis(1));
-        }
+        output.shutdown();
 
         assert_eq!(*bytes.lock().unwrap(), b"firstsecond");
+        assert!(!output.send_raw(b"third".to_vec()));
     }
 
     #[test]
@@ -118,5 +185,26 @@ mod tests {
         }
 
         assert!(output.failed());
+        output.shutdown();
+    }
+
+    #[test]
+    fn shutdown_does_not_wait_forever_for_blocked_stdout() {
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let output = Output::start_with_writer(BlockingWriter {
+            started: started_sender,
+            release: release_receiver,
+        });
+        assert!(output.send_raw(b"blocked".to_vec()));
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        output.shutdown();
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let _ = release_sender.send(());
     }
 }

@@ -642,6 +642,7 @@ name = "proxy-common"
 version = "6.8.23"
 dependencies = [
  "libc",
+ "percent-encoding",
  "serde",
  "serde_json",
  "tokio",
