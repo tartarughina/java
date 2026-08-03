@@ -73,6 +73,47 @@ impl SuppressedResponses {
     }
 }
 
+type TrackedRequests = Arc<Mutex<HashMap<Value, TrackedRequest>>>;
+type ActiveRewrites = Arc<Mutex<HashMap<Value, u64>>>;
+type SharedSuppressedResponses = Arc<Mutex<SuppressedResponses>>;
+type LatestWorkspaceJob = Arc<Mutex<Option<u64>>>;
+
+struct StdinContext {
+    writer: SharedWriter,
+    alive: Arc<AtomicBool>,
+    tracked: TrackedRequests,
+    active: ActiveRewrites,
+    jobs: Arc<AtomicU64>,
+    decompile: DecompileCoordinator,
+    output: Output,
+    suppressed: SharedSuppressedResponses,
+    latest_workspace: LatestWorkspaceJob,
+}
+
+struct StdoutContext {
+    pending: Arc<PendingResponses>,
+    alive: Arc<AtomicBool>,
+    tracked: TrackedRequests,
+    active: ActiveRewrites,
+    decompile: DecompileCoordinator,
+    output: Output,
+    suppressed: SharedSuppressedResponses,
+    latest_workspace: LatestWorkspaceJob,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InputRoute {
+    Forward,
+    Consumed,
+}
+
+#[derive(Debug, PartialEq)]
+enum OutputRoute {
+    Raw(Vec<u8>),
+    Value(Value),
+    Consumed,
+}
+
 fn main() {
     let output = Output::start();
     log::init(output.clone());
@@ -150,237 +191,37 @@ fn main() {
 
     // Track requests whose responses may contain jdt:// URIs so they can be
     // intercepted and rewritten.
-    let tracked_ids: Arc<Mutex<HashMap<Value, TrackedRequest>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-    let active_rewrites: Arc<Mutex<HashMap<Value, u64>>> = Arc::new(Mutex::new(HashMap::new()));
+    let tracked_ids: TrackedRequests = Arc::new(Mutex::new(HashMap::new()));
+    let active_rewrites: ActiveRewrites = Arc::new(Mutex::new(HashMap::new()));
     let suppressed_responses = Arc::new(Mutex::new(SuppressedResponses::default()));
-
-    // --- Thread 1: Zed stdin -> JDTLS stdin (track definition requests) ---
-    let stdin_writer = Arc::clone(&child_stdin);
-    let alive_stdin = Arc::clone(&alive);
-    let tracked_in = Arc::clone(&tracked_ids);
-    let active_in = Arc::clone(&active_rewrites);
-    let jobs_in = Arc::clone(&job_counter);
-    let decompile_in = decompile.clone();
-    let output_in = output.clone();
-    let suppressed_in = Arc::clone(&suppressed_responses);
     let latest_workspace_job = Arc::new(Mutex::new(None::<u64>));
-    let latest_workspace_in = Arc::clone(&latest_workspace_job);
-    thread::spawn(move || {
-        let stdin = io::stdin().lock();
-        let mut reader = LspReader::new(BufReader::new(stdin));
-        while alive_stdin.load(Ordering::Relaxed) {
-            match reader.read_message() {
-                Ok(Some(raw)) => {
-                    let mut forward_to_jdtls = true;
-                    let should_parse =
-                        raw_has_id(&raw) || contains_subslice(&raw, b"$/cancelRequest");
-                    if should_parse {
-                        let Some(msg) = parse_lsp_content(&raw) else {
-                            let mut writer = stdin_writer.lock().unwrap();
-                            if writer.write_all(&raw).is_err() || writer.flush().is_err() {
-                                break;
-                            }
-                            continue;
-                        };
-                        if msg.get("method").and_then(Value::as_str) == Some("$/cancelRequest") {
-                            if let Some(id) = msg.pointer("/params/id") {
-                                let already_suppressed = suppressed_in.lock().unwrap().contains(id);
-                                let (tracked, active_token) =
-                                    take_request_for_cancellation(&tracked_in, &active_in, id);
-                                if let Some(request) = tracked {
-                                    clear_latest_workspace(&latest_workspace_in, request.token);
-                                }
-                                let handled_locally = active_token.is_some();
-                                if let Some(token) = active_token {
-                                    clear_latest_workspace(&latest_workspace_in, token);
-                                    decompile_in.cancel(token);
-                                    output_in.send_value(&request_canceled(id));
-                                }
-                                forward_to_jdtls = !handled_locally && !already_suppressed;
-                            }
-                        } else if raw_has_id(&raw) {
-                            let token = jobs_in.fetch_add(1, Ordering::Relaxed);
-                            if let Some((id, request)) = tracked_request_for(&msg, token) {
-                                if request.method == "workspace/symbol" {
-                                    let previous =
-                                        latest_workspace_in.lock().unwrap().replace(token);
-                                    if let Some(previous) = previous {
-                                        let (suppressed, active) =
-                                            retire_request_token(&tracked_in, &active_in, previous);
-                                        if let Some(id) = suppressed {
-                                            suppressed_in.lock().unwrap().insert(id.clone());
-                                            cancel_jdtls_request(&stdin_writer, &id);
-                                        }
-                                        if active {
-                                            decompile_in.cancel(previous);
-                                        }
-                                    }
-                                }
-                                let (previous, active_token) = {
-                                    let mut tracked = tracked_in.lock().unwrap();
-                                    let mut active = active_in.lock().unwrap();
-                                    let previous = tracked.insert(id.clone(), request);
-                                    let active_token = active.remove(&id);
-                                    (previous, active_token)
-                                };
-                                if let Some(previous) = previous {
-                                    clear_latest_workspace(&latest_workspace_in, previous.token);
-                                }
-                                if let Some(active_token) = active_token {
-                                    decompile_in.cancel(active_token);
-                                }
-                            }
-                        }
-                    }
-                    if !forward_to_jdtls {
-                        continue;
-                    }
-                    let mut w = stdin_writer.lock().unwrap();
-                    if w.write_all(&raw).is_err() || w.flush().is_err() {
-                        break;
-                    }
-                }
-                Ok(None) | Err(_) => break,
-            }
-        }
-        alive_stdin.store(false, Ordering::Relaxed);
-    });
 
-    // --- Thread 2: JDTLS stdout -> rewrite jdt:// URIs, modify completions -> Zed stdout / resolve pending ---
-    let pending_out = Arc::clone(&pending);
-    let alive_out = Arc::clone(&alive);
-    let tracked_out = Arc::clone(&tracked_ids);
-    let active_out = Arc::clone(&active_rewrites);
-    let decompile_out = decompile.clone();
-    let output_router = output.clone();
-    let suppressed_out = Arc::clone(&suppressed_responses);
-    let latest_workspace_out = Arc::clone(&latest_workspace_job);
-    let stdout_thread = thread::spawn(move || {
-        let mut reader = LspReader::new(BufReader::new(child_stdout));
-        while let Ok(Some(raw)) = reader.read_message() {
-            // Fast path: notifications (no `id`) can't be responses we
-            // need to intercept. Forward the raw bytes without parsing.
-            if !raw_has_id(&raw) {
-                output_router.send_raw(raw);
-                continue;
-            }
+    // --- Thread 1: Zed stdin -> JDTLS stdin ---
+    let stdin_context = StdinContext {
+        writer: Arc::clone(&child_stdin),
+        alive: Arc::clone(&alive),
+        tracked: Arc::clone(&tracked_ids),
+        active: Arc::clone(&active_rewrites),
+        jobs: Arc::clone(&job_counter),
+        decompile: decompile.clone(),
+        output: output.clone(),
+        suppressed: Arc::clone(&suppressed_responses),
+        latest_workspace: Arc::clone(&latest_workspace_job),
+    };
+    thread::spawn(move || run_zed_input(stdin_context));
 
-            let Some(mut msg) = parse_lsp_content(&raw) else {
-                output_router.send_raw(raw);
-                continue;
-            };
-
-            // Route responses to pending HTTP requests
-            if pending_out.route(&msg) {
-                continue;
-            }
-            if msg
-                .get("id")
-                .is_some_and(|id| suppressed_out.lock().unwrap().take(id))
-            {
-                continue;
-            }
-
-            // Rewrite jdt:// URIs in location or documentation responses.
-            // The bounded coordinator keeps this router free to deliver
-            // java/classFileContents responses through `pending`.
-            if msg.get("method").is_none() {
-                let Some(id) = msg.get("id").cloned() else {
-                    output_router.send_raw(raw);
-                    continue;
-                };
-                let request = tracked_out.lock().unwrap().get(&id).cloned();
-                if let Some(request) = request {
-                    if let Some(fallback) = completion_resolve_fallback(&msg, &request) {
-                        remove_tracked_request(&tracked_out, &id, request.token);
-                        if should_log_completion_fallback() {
-                            lsp_warn!(
-                                "JDTLS completion resolution failed with -32603; \
-                                         using the unresolved item, so documentation, imports, \
-                                         commands, or additional edits may be missing"
-                            );
-                        }
-                        output_router.send_value(&fallback);
-                        continue;
-                    }
-                    if msg.get("error").is_some() {
-                        remove_tracked_request(&tracked_out, &id, request.token);
-                        clear_latest_workspace(&latest_workspace_out, request.token);
-                        output_router.send_raw(raw);
-                        continue;
-                    }
-                    if request.rewrite == RewriteKind::Completion {
-                        remove_tracked_request(&tracked_out, &id, request.token);
-                        process_completions(&mut msg);
-                        output_router.send_value(&msg);
-                        continue;
-                    }
-
-                    let output = output_router.clone();
-                    let sanitize_completion = request.method == "completionItem/resolve";
-                    let mode = match request.rewrite {
-                        RewriteKind::Locations => RewriteMode::Locations,
-                        RewriteKind::Documentation => RewriteMode::Strings,
-                        RewriteKind::Completion => unreachable!(),
-                    };
-                    let priority = if request.method == "workspace/symbol" {
-                        Priority::Bulk
-                    } else {
-                        Priority::Interactive
-                    };
-                    let deadline = std::time::Instant::now() + rewrite_timeout(&request.method);
-                    let workspace_job = (request.method == "workspace/symbol")
-                        .then(|| (Arc::clone(&latest_workspace_out), request.token));
-                    if !activate_rewrite(&tracked_out, &active_out, &id, request.token) {
-                        output_router.send_raw(raw);
-                        continue;
-                    }
-                    if decompile_out.is_canceled(request.token) {
-                        active_out.lock().unwrap().remove(&id);
-                        decompile_out.consume_cancellation(request.token);
-                        clear_latest_workspace(&latest_workspace_out, request.token);
-                        continue;
-                    }
-                    let active = Arc::clone(&active_out);
-                    let active_id = id;
-                    let completion_coordinator = decompile_out.clone();
-                    let job = RewriteJob {
-                        token: request.token,
-                        message: msg,
-                        mode,
-                        priority,
-                        deadline,
-                        complete: Box::new(move |mut message| {
-                            if sanitize_completion {
-                                sanitize_resolved_completion(&mut message);
-                            }
-                            let owns_response =
-                                active.lock().unwrap().remove(&active_id) == Some(request.token);
-                            completion_coordinator.consume_cancellation(request.token);
-                            if owns_response {
-                                output.send_value(&message);
-                            }
-                            if let Some((latest, token)) = workspace_job {
-                                clear_latest_workspace(&latest, token);
-                            }
-                        }),
-                    };
-                    if let Err(job) = decompile_out.submit(job) {
-                        let RewriteJob {
-                            message, complete, ..
-                        } = job;
-                        complete(message);
-                    }
-                    continue;
-                }
-            }
-
-            // Passthrough
-            output_router.send_raw(raw);
-        }
-        alive_out.store(false, Ordering::Relaxed);
-    });
+    // --- Thread 2: JDTLS stdout -> Zed stdout ---
+    let stdout_context = StdoutContext {
+        pending: Arc::clone(&pending),
+        alive: Arc::clone(&alive),
+        tracked: Arc::clone(&tracked_ids),
+        active: Arc::clone(&active_rewrites),
+        decompile: decompile.clone(),
+        output: output.clone(),
+        suppressed: Arc::clone(&suppressed_responses),
+        latest_workspace: Arc::clone(&latest_workspace_job),
+    };
+    let stdout_thread = thread::spawn(move || run_jdtls_output(child_stdout, stdout_context));
 
     // --- Thread 3: HTTP server for extension requests ---
     let http_writer = Arc::clone(&child_stdin);
@@ -431,6 +272,251 @@ fn main() {
     output.shutdown();
     decompile.cleanup_cache();
     let _ = fs::remove_file(&port_file);
+}
+
+fn run_zed_input(context: StdinContext) {
+    let stdin = io::stdin().lock();
+    let mut reader = LspReader::new(BufReader::new(stdin));
+    while context.alive.load(Ordering::Relaxed) {
+        let raw = match reader.read_message() {
+            Ok(Some(raw)) => raw,
+            Ok(None) | Err(_) => break,
+        };
+        if route_zed_message(&context, &raw) == InputRoute::Forward
+            && !write_to_jdtls(&context.writer, &raw)
+        {
+            break;
+        }
+    }
+    context.alive.store(false, Ordering::Relaxed);
+}
+
+fn route_zed_message(context: &StdinContext, raw: &[u8]) -> InputRoute {
+    let has_id = raw_has_id(raw);
+    if !has_id && !contains_subslice(raw, b"$/cancelRequest") {
+        return InputRoute::Forward;
+    }
+    let Some(message) = parse_lsp_content(raw) else {
+        return InputRoute::Forward;
+    };
+    if message.get("method").and_then(Value::as_str) == Some("$/cancelRequest") {
+        return route_zed_cancellation(context, &message);
+    }
+    if has_id {
+        track_zed_request(context, &message);
+    }
+    InputRoute::Forward
+}
+
+fn route_zed_cancellation(context: &StdinContext, message: &Value) -> InputRoute {
+    let Some(id) = message.pointer("/params/id") else {
+        return InputRoute::Forward;
+    };
+    let already_suppressed = context.suppressed.lock().unwrap().contains(id);
+    let (tracked, active_token) =
+        take_request_for_cancellation(&context.tracked, &context.active, id);
+    if let Some(request) = tracked {
+        clear_latest_workspace(&context.latest_workspace, request.token);
+    }
+    let handled_locally = active_token.is_some();
+    if let Some(token) = active_token {
+        clear_latest_workspace(&context.latest_workspace, token);
+        context.decompile.cancel(token);
+        context.output.send_value(&request_canceled(id));
+    }
+
+    if handled_locally || already_suppressed {
+        InputRoute::Consumed
+    } else {
+        InputRoute::Forward
+    }
+}
+
+fn track_zed_request(context: &StdinContext, message: &Value) {
+    let token = context.jobs.fetch_add(1, Ordering::Relaxed);
+    let Some((id, request)) = tracked_request_for(message, token) else {
+        return;
+    };
+    if request.method == "workspace/symbol" {
+        supersede_workspace_job(context, token);
+    }
+
+    let (previous, active_token) = {
+        let mut tracked = context.tracked.lock().unwrap();
+        let mut active = context.active.lock().unwrap();
+        let previous = tracked.insert(id.clone(), request);
+        let active_token = active.remove(&id);
+        (previous, active_token)
+    };
+    if let Some(previous) = previous {
+        clear_latest_workspace(&context.latest_workspace, previous.token);
+    }
+    if let Some(active_token) = active_token {
+        context.decompile.cancel(active_token);
+    }
+}
+
+fn supersede_workspace_job(context: &StdinContext, token: u64) {
+    let previous = context.latest_workspace.lock().unwrap().replace(token);
+    let Some(previous) = previous else {
+        return;
+    };
+    let (suppressed, active) = retire_request_token(&context.tracked, &context.active, previous);
+    if let Some(id) = suppressed {
+        context.suppressed.lock().unwrap().insert(id.clone());
+        cancel_jdtls_request(&context.writer, &id);
+    }
+    if active {
+        context.decompile.cancel(previous);
+    }
+}
+
+fn write_to_jdtls(writer: &SharedWriter, raw: &[u8]) -> bool {
+    let mut writer = writer.lock().unwrap();
+    writer.write_all(raw).is_ok() && writer.flush().is_ok()
+}
+
+fn run_jdtls_output(reader: impl io::Read, context: StdoutContext) {
+    let mut reader = LspReader::new(BufReader::new(reader));
+    while let Ok(Some(raw)) = reader.read_message() {
+        match route_jdtls_message(&context, raw) {
+            OutputRoute::Raw(raw) => {
+                context.output.send_raw(raw);
+            }
+            OutputRoute::Value(message) => {
+                context.output.send_value(&message);
+            }
+            OutputRoute::Consumed => {}
+        }
+    }
+    context.alive.store(false, Ordering::Relaxed);
+}
+
+fn route_jdtls_message(context: &StdoutContext, raw: Vec<u8>) -> OutputRoute {
+    // Notifications cannot be responses that the proxy needs to intercept.
+    if !raw_has_id(&raw) {
+        return OutputRoute::Raw(raw);
+    }
+    let Some(message) = parse_lsp_content(&raw) else {
+        return OutputRoute::Raw(raw);
+    };
+    if context.pending.route(&message) {
+        return OutputRoute::Consumed;
+    }
+    if message
+        .get("id")
+        .is_some_and(|id| context.suppressed.lock().unwrap().take(id))
+    {
+        return OutputRoute::Consumed;
+    }
+    if message.get("method").is_some() {
+        return OutputRoute::Raw(raw);
+    }
+    let Some(id) = message.get("id").cloned() else {
+        return OutputRoute::Raw(raw);
+    };
+    let request = context.tracked.lock().unwrap().get(&id).cloned();
+    let Some(request) = request else {
+        return OutputRoute::Raw(raw);
+    };
+
+    route_tracked_response(context, raw, message, id, request)
+}
+
+fn route_tracked_response(
+    context: &StdoutContext,
+    raw: Vec<u8>,
+    mut message: Value,
+    id: Value,
+    request: TrackedRequest,
+) -> OutputRoute {
+    if let Some(fallback) = completion_resolve_fallback(&message, &request) {
+        remove_tracked_request(&context.tracked, &id, request.token);
+        if should_log_completion_fallback() {
+            lsp_warn!(
+                "JDTLS completion resolution failed with -32603; \
+                 using the unresolved item, so documentation, imports, \
+                 commands, or additional edits may be missing"
+            );
+        }
+        return OutputRoute::Value(fallback);
+    }
+    if message.get("error").is_some() {
+        remove_tracked_request(&context.tracked, &id, request.token);
+        clear_latest_workspace(&context.latest_workspace, request.token);
+        return OutputRoute::Raw(raw);
+    }
+    if request.rewrite == RewriteKind::Completion {
+        remove_tracked_request(&context.tracked, &id, request.token);
+        process_completions(&mut message);
+        return OutputRoute::Value(message);
+    }
+
+    queue_rewrite_response(context, raw, message, id, request)
+}
+
+fn queue_rewrite_response(
+    context: &StdoutContext,
+    raw: Vec<u8>,
+    message: Value,
+    id: Value,
+    request: TrackedRequest,
+) -> OutputRoute {
+    let sanitize_completion = request.method == "completionItem/resolve";
+    let mode = match request.rewrite {
+        RewriteKind::Locations => RewriteMode::Locations,
+        RewriteKind::Documentation => RewriteMode::Strings,
+        RewriteKind::Completion => unreachable!(),
+    };
+    let priority = if request.method == "workspace/symbol" {
+        Priority::Bulk
+    } else {
+        Priority::Interactive
+    };
+    let deadline = std::time::Instant::now() + rewrite_timeout(&request.method);
+    let workspace_job = (request.method == "workspace/symbol")
+        .then(|| (Arc::clone(&context.latest_workspace), request.token));
+    if !activate_rewrite(&context.tracked, &context.active, &id, request.token) {
+        return OutputRoute::Raw(raw);
+    }
+    if context.decompile.is_canceled(request.token) {
+        context.active.lock().unwrap().remove(&id);
+        context.decompile.consume_cancellation(request.token);
+        clear_latest_workspace(&context.latest_workspace, request.token);
+        return OutputRoute::Consumed;
+    }
+
+    let token = request.token;
+    let output = context.output.clone();
+    let active = Arc::clone(&context.active);
+    let completion_coordinator = context.decompile.clone();
+    let job = RewriteJob {
+        token,
+        message,
+        mode,
+        priority,
+        deadline,
+        complete: Box::new(move |mut message| {
+            if sanitize_completion {
+                sanitize_resolved_completion(&mut message);
+            }
+            let owns_response = active.lock().unwrap().remove(&id) == Some(token);
+            completion_coordinator.consume_cancellation(token);
+            if owns_response {
+                output.send_value(&message);
+            }
+            if let Some((latest, token)) = workspace_job {
+                clear_latest_workspace(&latest, token);
+            }
+        }),
+    };
+    if let Err(job) = context.decompile.submit(job) {
+        let RewriteJob {
+            message, complete, ..
+        } = job;
+        complete(message);
+    }
+    OutputRoute::Consumed
 }
 
 // --- Utilities ---
@@ -604,6 +690,198 @@ fn rewrite_timeout(method: &str) -> std::time::Duration {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    struct RoutingFixture {
+        writer: SharedWriter,
+        alive: Arc<AtomicBool>,
+        jobs: Arc<AtomicU64>,
+        pending: Arc<PendingResponses>,
+        tracked: TrackedRequests,
+        active: ActiveRewrites,
+        suppressed: SharedSuppressedResponses,
+        latest_workspace: LatestWorkspaceJob,
+        decompile: DecompileCoordinator,
+        output: Output,
+    }
+
+    impl RoutingFixture {
+        fn new() -> Self {
+            let writer: SharedWriter = Arc::new(Mutex::new(Box::new(Vec::<u8>::new())));
+            let pending = Arc::new(PendingResponses::new());
+            let decompile = DecompileCoordinator::new(
+                Arc::clone(&writer),
+                Arc::clone(&pending),
+                "routing-test-".to_string(),
+            );
+            Self {
+                writer,
+                alive: Arc::new(AtomicBool::new(true)),
+                jobs: Arc::new(AtomicU64::new(1)),
+                pending,
+                tracked: Arc::new(Mutex::new(HashMap::new())),
+                active: Arc::new(Mutex::new(HashMap::new())),
+                suppressed: Arc::new(Mutex::new(SuppressedResponses::default())),
+                latest_workspace: Arc::new(Mutex::new(None)),
+                decompile,
+                output: Output::start(),
+            }
+        }
+
+        fn stdin_context(&self) -> StdinContext {
+            StdinContext {
+                writer: Arc::clone(&self.writer),
+                alive: Arc::clone(&self.alive),
+                tracked: Arc::clone(&self.tracked),
+                active: Arc::clone(&self.active),
+                jobs: Arc::clone(&self.jobs),
+                decompile: self.decompile.clone(),
+                output: self.output.clone(),
+                suppressed: Arc::clone(&self.suppressed),
+                latest_workspace: Arc::clone(&self.latest_workspace),
+            }
+        }
+
+        fn stdout_context(&self) -> StdoutContext {
+            StdoutContext {
+                pending: Arc::clone(&self.pending),
+                alive: Arc::clone(&self.alive),
+                tracked: Arc::clone(&self.tracked),
+                active: Arc::clone(&self.active),
+                decompile: self.decompile.clone(),
+                output: self.output.clone(),
+                suppressed: Arc::clone(&self.suppressed),
+                latest_workspace: Arc::clone(&self.latest_workspace),
+            }
+        }
+    }
+
+    impl Drop for RoutingFixture {
+        fn drop(&mut self) {
+            self.decompile.shutdown();
+            self.output.shutdown();
+        }
+    }
+
+    fn frame(value: &Value) -> Vec<u8> {
+        encode_lsp(value).into_bytes()
+    }
+
+    #[test]
+    fn stdin_router_tracks_requests_and_forwards_cancellation_before_rewrite() {
+        let fixture = RoutingFixture::new();
+        let context = fixture.stdin_context();
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "textDocument/definition",
+            "params": {}
+        });
+
+        assert_eq!(
+            route_zed_message(&context, &frame(&request)),
+            InputRoute::Forward
+        );
+        assert_eq!(
+            fixture.tracked.lock().unwrap().get(&json!(7)),
+            Some(&TrackedRequest::new(
+                1,
+                "textDocument/definition",
+                RewriteKind::Locations,
+                None
+            ))
+        );
+
+        let cancellation = json!({
+            "jsonrpc": "2.0",
+            "method": "$/cancelRequest",
+            "params": { "id": 7 }
+        });
+        assert_eq!(
+            route_zed_message(&context, &frame(&cancellation)),
+            InputRoute::Forward
+        );
+        assert!(fixture.tracked.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn stdout_router_returns_processed_completion_values() {
+        let fixture = RoutingFixture::new();
+        let context = fixture.stdout_context();
+        fixture.tracked.lock().unwrap().insert(
+            json!(9),
+            TrackedRequest::new(1, "textDocument/completion", RewriteKind::Completion, None),
+        );
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "result": [{
+                "kind": 15,
+                "textEditText": "$TM_SELECTED_TEXT.field"
+            }]
+        });
+
+        assert_eq!(
+            route_jdtls_message(&context, frame(&response)),
+            OutputRoute::Value(json!({
+                "jsonrpc": "2.0",
+                "id": 9,
+                "result": [{
+                    "kind": 15,
+                    "textEditText": ".field"
+                }]
+            }))
+        );
+        assert!(fixture.tracked.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn stdout_router_consumes_pending_and_suppressed_responses() {
+        let fixture = RoutingFixture::new();
+        let context = fixture.stdout_context();
+        let pending_id = json!("proxy-request");
+        let receiver = fixture.pending.register(pending_id.clone());
+        let pending_response = json!({ "jsonrpc": "2.0", "id": pending_id, "result": "ok" });
+
+        assert_eq!(
+            route_jdtls_message(&context, frame(&pending_response)),
+            OutputRoute::Consumed
+        );
+        assert_eq!(receiver.recv().unwrap(), pending_response);
+
+        let suppressed_id = json!("superseded-request");
+        fixture
+            .suppressed
+            .lock()
+            .unwrap()
+            .insert(suppressed_id.clone());
+        let suppressed_response = json!({ "jsonrpc": "2.0", "id": suppressed_id, "result": null });
+        assert_eq!(
+            route_jdtls_message(&context, frame(&suppressed_response)),
+            OutputRoute::Consumed
+        );
+        assert!(!fixture
+            .suppressed
+            .lock()
+            .unwrap()
+            .contains(&json!("superseded-request")));
+    }
+
+    #[test]
+    fn stdio_routers_preserve_unhandled_raw_frames() {
+        let fixture = RoutingFixture::new();
+        let stdin_context = fixture.stdin_context();
+        let stdout_context = fixture.stdout_context();
+        let malformed = b"Content-Length: 6\r\n\r\n{\"id\":".to_vec();
+
+        assert_eq!(
+            route_zed_message(&stdin_context, &malformed),
+            InputRoute::Forward
+        );
+        assert_eq!(
+            route_jdtls_message(&stdout_context, malformed.clone()),
+            OutputRoute::Raw(malformed)
+        );
+    }
 
     #[test]
     fn tracks_location_response_methods() {
