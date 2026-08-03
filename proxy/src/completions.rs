@@ -43,19 +43,15 @@ pub fn process_completions(msg: &mut Value) {
 }
 
 fn sanitize_completion_item(item: &mut Value) {
-    strip_tm_selected_text(item, "textEditText");
-    strip_tm_selected_text(item, "insertText");
-    if let Some(new_text) = item.pointer("/textEdit/newText").and_then(Value::as_str) {
-        if new_text.contains("$TM_SELECTED_TEXT") {
-            item["textEdit"]["newText"] = Value::String(new_text.replace("$TM_SELECTED_TEXT", ""));
-        }
-    }
+    strip_tm_selected_text(item, "/textEditText");
+    strip_tm_selected_text(item, "/insertText");
+    strip_tm_selected_text(item, "/textEdit/newText");
 }
 
-fn strip_tm_selected_text(item: &mut Value, key: &str) {
-    if let Some(text) = item.get(key).and_then(Value::as_str) {
+fn strip_tm_selected_text(item: &mut Value, pointer: &str) {
+    if let Some(Value::String(text)) = item.pointer_mut(pointer) {
         if text.contains("$TM_SELECTED_TEXT") {
-            item[key] = Value::String(text.replace("$TM_SELECTED_TEXT", ""));
+            *text = text.replace("$TM_SELECTED_TEXT", "");
         }
     }
 }
@@ -127,6 +123,20 @@ mod tests {
             response["result"]["items"][0]["insertText"],
             json!(".trim()")
         );
+    }
+
+    #[test]
+    fn sanitizes_text_edit_text() {
+        let mut response = json!({
+            "result": [{
+                "kind": 15,
+                "textEditText": "$TM_SELECTED_TEXT.field"
+            }]
+        });
+
+        process_completions(&mut response);
+
+        assert_eq!(response["result"][0]["textEditText"], json!(".field"));
     }
 
     #[test]
