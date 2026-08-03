@@ -8,9 +8,7 @@ use zed_extension_api::{
 use crate::{
     config::get_bazel_path,
     downloadable::Downloadable,
-    util::{
-        create_path_if_not_exists, get_curr_dir, mark_checked_once, should_use_local_or_download,
-    },
+    util::{create_path_if_not_exists, get_curr_dir, should_use_local_or_download},
 };
 
 const BAZEL_INSTALL_PATH: &str = "bazel";
@@ -136,14 +134,15 @@ impl Downloadable for Bazel {
         self.bundles.is_some()
     }
 
-    fn fetch_latest_version(&self) -> zed::Result<String> {
+    fn fetch_latest_version(&self, _worktree: &Worktree) -> zed::Result<String> {
         Ok(BAZEL_VERSION.to_string())
     }
 
     fn download(
         &mut self,
-        version: &str,
+        _version: &str,
         language_server_id: &LanguageServerId,
+        _worktree: &Worktree,
     ) -> zed::Result<PathBuf> {
         set_language_server_installation_status(
             language_server_id,
@@ -164,8 +163,6 @@ impl Downloadable for Bazel {
             .resolve_bundles(&install_root)
             .ok_or("Failed to find Bazel bundles after extraction")?;
         self.bundles = Some(bundles);
-
-        let _ = mark_checked_once(BAZEL_INSTALL_PATH, version);
 
         Ok(install_root.join(PLUGINS_DIR))
     }
@@ -189,9 +186,12 @@ impl Downloadable for Bazel {
             return Ok(dir);
         }
 
-        if let Some(dir) =
-            should_use_local_or_download(configuration, self.find_local(), Self::INSTALL_PATH)?
-        {
+        if let Some(dir) = should_use_local_or_download(
+            configuration,
+            self.find_local(),
+            Self::INSTALL_PATH,
+            &self.update_check_path(),
+        )? {
             let bundles = self
                 .resolve_bundles(&PathBuf::from(BAZEL_INSTALL_PATH))
                 .ok_or("Bazel bundles missing from local installation")?;
@@ -199,8 +199,35 @@ impl Downloadable for Bazel {
             return Ok(dir);
         }
 
-        let version = self.fetch_latest_version()?;
-        self.download(&version, language_server_id)
+        let downloaded = self
+            .version_for_download(language_server_id, configuration, worktree)
+            .and_then(|(version, update_marker)| {
+                self.download(&version, language_server_id, worktree)
+                    .map(|path| (path, version, update_marker))
+            });
+
+        match downloaded {
+            Ok((path, version, update_marker)) => {
+                if update_marker {
+                    self.record_update_check(&version);
+                }
+                Ok(path)
+            }
+            Err(err) => match self.find_local() {
+                Some(path) => {
+                    let bundles = self
+                        .resolve_bundles(&path)
+                        .ok_or("Bazel bundles missing from local installation")?;
+                    self.bundles = Some(bundles);
+                    println!(
+                        "Failed to update {}, falling back to local installation: {err}",
+                        Self::INSTALL_PATH
+                    );
+                    Ok(path)
+                }
+                None => Err(err),
+            },
+        }
     }
 
     fn user_configured_path(
