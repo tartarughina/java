@@ -44,20 +44,18 @@ impl PendingResponses {
             return false;
         };
 
-        let sender = {
+        let (sender, owned) = {
             let mut state = self.state.lock().unwrap();
             let sender = state.pending.remove(id);
-            if sender.is_none() && state.owned.contains(id) {
-                return true;
-            }
-            sender
+            let owned = state.owned.remove(id);
+            (sender, owned)
         };
         if let Some(sender) = sender {
             let _ = sender.send(message.clone());
             return true;
         }
 
-        false
+        owned
     }
 
     pub fn clear(&self) {
@@ -81,7 +79,7 @@ mod tests {
 
         assert!(pending.route(&response));
         assert_eq!(receiver.recv().unwrap(), response);
-        assert!(pending.route(&response));
+        assert!(!pending.route(&response));
     }
 
     #[test]
@@ -91,11 +89,13 @@ mod tests {
         pending.register(retired.clone());
         pending.remove(&retired);
 
-        assert!(pending.route(&json!({
+        let response = json!({
             "jsonrpc": "2.0",
             "id": "proxy-owned-late",
             "result": null
-        })));
+        });
+        assert!(pending.route(&response));
+        assert!(!pending.route(&response));
         assert!(!pending.route(&json!({
             "jsonrpc": "2.0",
             "id": 7,
@@ -121,7 +121,7 @@ mod tests {
     }
 
     #[test]
-    fn ownership_is_retained_for_the_entire_session() {
+    fn ownership_is_retained_until_a_response_arrives() {
         let pending = PendingResponses::new();
         for id in 0..=1024 {
             let id = json!(format!("proxy-owned-{id}"));
