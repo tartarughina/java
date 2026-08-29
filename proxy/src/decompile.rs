@@ -741,6 +741,30 @@ fn cache_path_in(directory: &Path, uri: &str) -> PathBuf {
         .join(format!("{name}.java"))
 }
 
+fn sidecar_path(target: &Path) -> PathBuf {
+    target.with_added_extension("jdt-uri")
+}
+
+fn ensure_jdt_uri_sidecar(target: &Path, jdt_uri: &str) {
+    let sidecar = sidecar_path(target);
+    if sidecar.is_file() {
+        return;
+    }
+    let _ = fs::write(&sidecar, jdt_uri);
+}
+
+/// Resolve the original `jdt://` URI for a cached decompiled source file.
+///
+/// The mapping is stored on disk next to the source file so it survives across
+/// proxy processes. Zed opens decompiled files in their own worktree, which
+/// spawns a fresh `java-lsp-proxy`; that process must be able to reverse-map the
+/// temporary `file://` document back to its `jdt://` class URI.
+pub(crate) fn jdt_uri_for_cached_file(target: &Path) -> Option<String> {
+    let content = fs::read_to_string(sidecar_path(target)).ok()?;
+    let uri = content.trim();
+    (!uri.is_empty()).then(|| uri.to_string())
+}
+
 fn write_cached_source(directory: &Path, uri: &str, content: &[u8]) -> Option<String> {
     if content.is_empty() {
         return None;
@@ -755,6 +779,7 @@ fn write_cached_source(directory: &Path, uri: &str, content: &[u8]) -> Option<St
     }
     let target = cache_path_in(directory, uri);
     if target.is_file() {
+        ensure_jdt_uri_sidecar(&target, uri);
         return Some(path_to_file_uri(&target));
     }
     if let Some(parent) = target.parent() {
@@ -778,9 +803,13 @@ fn write_cached_source(directory: &Path, uri: &str, content: &[u8]) -> Option<St
     })();
 
     match result {
-        Ok(()) => Some(path_to_file_uri(&target)),
+        Ok(()) => {
+            ensure_jdt_uri_sidecar(&target, uri);
+            Some(path_to_file_uri(&target))
+        }
         Err(_error) if target.is_file() => {
             let _ = fs::remove_file(&temporary);
+            ensure_jdt_uri_sidecar(&target, uri);
             Some(path_to_file_uri(&target))
         }
         Err(error) => {
@@ -1453,5 +1482,28 @@ mod tests {
 
         assert_eq!(write_cached_source(&directory, &uri, b""), None);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn cached_sources_keep_reverse_mapping() {
+        let uri = "jdt://contents/java.base/java.lang/String.class";
+        let directory = session_cache_dir("reverse-mapping-test");
+        let path = cache_path_in(&directory, uri);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(sidecar_path(&path));
+
+        let file_uri = write_cached_source(&directory, uri, b"public class String {}").unwrap();
+        assert_eq!(file_uri, path_to_file_uri(&path));
+        assert_eq!(jdt_uri_for_cached_file(&path).as_deref(), Some(uri));
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(sidecar_path(&path));
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn reverse_mapping_is_missing_for_unrelated_files() {
+        let path = PathBuf::from("/tmp/no-sidecar/String.java");
+        assert_eq!(jdt_uri_for_cached_file(&path), None);
     }
 }

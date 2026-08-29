@@ -11,7 +11,8 @@ use http::handle_http;
 use output::Output;
 use pending::PendingResponses;
 use proxy_common::{
-    contains_subslice, encode_lsp, parse_lsp_content, raw_has_id, spawn_parent_monitor, LspReader,
+    contains_subslice, encode_lsp, file_uri_to_path, parse_lsp_content, raw_has_id,
+    spawn_parent_monitor, LspReader,
 };
 use serde_json::{json, Value};
 use std::{
@@ -282,6 +283,11 @@ fn run_zed_input(context: StdinContext) {
             Ok(Some(raw)) => raw,
             Ok(None) | Err(_) => break,
         };
+        let raw = if raw_has_id(&raw) {
+            rewrite_request_uri(raw)
+        } else {
+            raw
+        };
         if route_zed_message(&context, &raw) == InputRoute::Forward
             && !write_to_jdtls(&context.writer, &raw)
         {
@@ -294,6 +300,16 @@ fn run_zed_input(context: StdinContext) {
 fn route_zed_message(context: &StdinContext, raw: &[u8]) -> InputRoute {
     let has_id = raw_has_id(raw);
     if !has_id && !contains_subslice(raw, b"$/cancelRequest") {
+        // Editor notifications carry no id. Decompiled-source worktrees must not
+        // leak didOpen/didChange/didSave/didClose into JDTLS: those documents
+        // live under /tmp/jdtls_decompiled and only exist as a navigation target.
+        if contains_subslice(raw, b"jdtls_decompiled") {
+            if let Some(message) = parse_lsp_content(raw) {
+                if is_decompiled_document_notification(&message) {
+                    return InputRoute::Consumed;
+                }
+            }
+        }
         return InputRoute::Forward;
     }
     let Some(message) = parse_lsp_content(raw) else {
@@ -306,6 +322,56 @@ fn route_zed_message(context: &StdinContext, raw: &[u8]) -> InputRoute {
         track_zed_request(context, &message);
     }
     InputRoute::Forward
+}
+
+/// Rewrite `file://` document URIs that point at a cached decompiled source
+/// file back to their original `jdt://` URI before forwarding to JDTLS. This is
+/// what makes further navigation *inside* a decompiled class work.
+fn rewrite_request_uri(raw: Vec<u8>) -> Vec<u8> {
+    if !contains_subslice(&raw, b"jdtls_decompiled") {
+        return raw;
+    }
+    let Some(mut message) = parse_lsp_content(&raw) else {
+        return raw;
+    };
+    let Some(file_uri) = message
+        .pointer("/params/textDocument/uri")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        return raw;
+    };
+    let Some(path) = file_uri_to_path(&file_uri) else {
+        return raw;
+    };
+    let Some(jdt_uri) = decompile::jdt_uri_for_cached_file(&path) else {
+        return raw;
+    };
+
+    *message.pointer_mut("/params/textDocument/uri").unwrap() = Value::String(jdt_uri);
+    encode_lsp(&message).into_bytes()
+}
+
+/// Whether an editor notification concerns a decompiled-source document whose
+/// lifecycle JDTLS must not observe.
+fn is_decompiled_document_notification(message: &Value) -> bool {
+    let Some(method) = message.get("method").and_then(Value::as_str) else {
+        return false;
+    };
+    if !matches!(
+        method,
+        "textDocument/didOpen"
+            | "textDocument/didChange"
+            | "textDocument/didSave"
+            | "textDocument/didClose"
+    ) {
+        return false;
+    }
+
+    message
+        .pointer("/params/textDocument/uri")
+        .and_then(Value::as_str)
+        .is_some_and(|uri| uri.contains("jdtls_decompiled"))
 }
 
 fn route_zed_cancellation(context: &StdinContext, message: &Value) -> InputRoute {
@@ -801,6 +867,87 @@ mod tests {
             InputRoute::Forward
         );
         assert!(fixture.tracked.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn rewrites_decompiled_file_request_uri() {
+        let dir = std::env::temp_dir().join("jdtls_decompiled/rewrite-test");
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("String.java");
+        fs::write(&target, "class String {}").unwrap();
+        fs::write(
+            format!("{}.jdt-uri", target.display()),
+            "jdt://contents/java.base/java.lang/String.class",
+        )
+        .unwrap();
+
+        let file_uri = proxy_common::path_to_file_uri(&target);
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "textDocument/definition",
+            "params": {
+                "textDocument": { "uri": file_uri },
+                "position": { "line": 0, "character": 0 }
+            }
+        });
+
+        let rewritten = rewrite_request_uri(frame(&request));
+        let parsed = parse_lsp_content(&rewritten).unwrap();
+        assert_eq!(
+            parsed["params"]["textDocument"]["uri"],
+            json!("jdt://contents/java.base/java.lang/String.class")
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn decompiled_document_notifications_are_recognized() {
+        assert!(is_decompiled_document_notification(&json!({
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": "file:///tmp/jdtls_decompiled/session_x/uri_y/String.java"
+                }
+            }
+        })));
+        assert!(!is_decompiled_document_notification(&json!({
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": "file:///workspace/Foo.java"
+                }
+            }
+        })));
+        assert!(!is_decompiled_document_notification(&json!({
+            "method": "textDocument/publishDiagnostics",
+            "params": {
+                "textDocument": {
+                    "uri": "file:///tmp/jdtls_decompiled/session_x/uri_y/String.java"
+                }
+            }
+        })));
+    }
+
+    #[test]
+    fn suppresses_decompiled_document_notifications() {
+        let fixture = RoutingFixture::new();
+        let context = fixture.stdin_context();
+        let notification = json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didOpen",
+            "params": {
+                "textDocument": {
+                    "uri": "file:///tmp/jdtls_decompiled/session_x/uri_y/String.java"
+                }
+            }
+        });
+
+        assert_eq!(
+            route_zed_message(&context, &frame(&notification)),
+            InputRoute::Consumed
+        );
     }
 
     #[test]

@@ -18,4 +18,4 @@ pub use lsp::{
     write_raw, write_to_stdout, LspReader, CONTENT_LENGTH, HEADER_SEP,
 };
 pub use platform::spawn_parent_monitor;
-pub use uri::path_to_file_uri;
+pub use uri::{file_uri_to_path, path_to_file_uri};
