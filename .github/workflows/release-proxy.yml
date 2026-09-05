@@ -23,11 +23,11 @@ jobs:
             runner: macos-15-intel
             proxy_asset: java-lsp-proxy-darwin-x86_64.tar.gz
             bridge_asset: gradle-lsp-bridge-darwin-x86_64.tar.gz
-          - target: x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-musl
             runner: ubuntu-22.04
             proxy_asset: java-lsp-proxy-linux-x86_64.tar.gz
             bridge_asset: gradle-lsp-bridge-linux-x86_64.tar.gz
-          - target: aarch64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-musl
             runner: ubuntu-22.04-arm
             proxy_asset: java-lsp-proxy-linux-aarch64.tar.gz
             bridge_asset: gradle-lsp-bridge-linux-aarch64.tar.gz
