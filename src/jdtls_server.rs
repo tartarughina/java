@@ -12,7 +12,10 @@ use crate::{
     debugger::Debugger,
     downloadable::Downloadable,
     jdk::Jdk,
-    jdtls::{Jdtls, Lombok, build_jdtls_launch_args, get_jdtls_launcher_from_path},
+    jdtls::{
+        Jdtls, Lombok, append_jdtls_data_args, build_jdtls_launch_args,
+        get_configured_jdtls_data_path, get_jdtls_launcher_from_path,
+    },
     language_server::LanguageServer,
     proxy::Proxy,
     util::{path_to_file_uri, path_to_string},
@@ -82,15 +85,17 @@ impl LanguageServer for JdtlsServer {
             None
         };
 
-        if let Some(launcher) = get_jdtls_launcher(&configuration, worktree) {
+        let configured_launcher = get_jdtls_launcher(&configuration, worktree)
+            .or_else(|| get_jdtls_launcher_from_path(worktree));
+        if let Some(launcher) = configured_launcher {
             args.push(launcher);
             if let Some(lombok_jvm_arg) = lombok_jvm_arg {
                 args.push(format!("--jvm-arg={lombok_jvm_arg}"));
             }
-        } else if let Some(launcher) = get_jdtls_launcher_from_path(worktree) {
-            args.push(launcher);
-            if let Some(lombok_jvm_arg) = lombok_jvm_arg {
-                args.push(format!("--jvm-arg={lombok_jvm_arg}"));
+            if let Some(data_path) = get_configured_jdtls_data_path(&configuration, worktree)
+                .map_err(|err| format!("Failed to determine JDTLS data path: {err}"))?
+            {
+                append_jdtls_data_args(&mut args, &data_path)?;
             }
         } else {
             let jdtls_path = self
