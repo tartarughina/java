@@ -14,7 +14,7 @@ use crate::{
     jdk::Jdk,
     jdtls::{
         Jdtls, Lombok, append_jdtls_data_args, build_jdtls_launch_args,
-        get_configured_jdtls_data_path, get_jdtls_launcher_from_path,
+        get_configured_jdtls_data_path, get_default_jdtls_data_path, get_jdtls_launcher_from_path,
     },
     language_server::LanguageServer,
     proxy::Proxy,
@@ -55,6 +55,8 @@ impl LanguageServer for JdtlsServer {
             env::current_dir().map_err(|err| format!("Failed to get current directory: {err}"))?;
 
         let configuration = self.workspace_configuration(language_server_id, worktree)?;
+        let configured_data_path = get_configured_jdtls_data_path(&configuration, worktree)
+            .map_err(|err| format!("Failed to determine JDTLS data path: {err}"))?;
 
         let mut env = Vec::new();
 
@@ -92,12 +94,15 @@ impl LanguageServer for JdtlsServer {
             if let Some(lombok_jvm_arg) = lombok_jvm_arg {
                 args.push(format!("--jvm-arg={lombok_jvm_arg}"));
             }
-            if let Some(data_path) = get_configured_jdtls_data_path(&configuration, worktree)
-                .map_err(|err| format!("Failed to determine JDTLS data path: {err}"))?
-            {
-                append_jdtls_data_args(&mut args, &data_path)?;
+            if let Some(data_path) = configured_data_path.as_deref() {
+                append_jdtls_data_args(&mut args, data_path)?;
             }
         } else {
+            let data_path = match configured_data_path {
+                Some(data_path) => data_path,
+                None => get_default_jdtls_data_path(worktree)
+                    .map_err(|err| format!("Failed to determine JDTLS data path: {err}"))?,
+            };
             let jdtls_path = self
                 .jdtls
                 .get_or_download(language_server_id, &configuration, worktree)
@@ -105,6 +110,7 @@ impl LanguageServer for JdtlsServer {
             args.extend(
                 build_jdtls_launch_args(
                     &jdtls_path,
+                    &data_path,
                     &configuration,
                     worktree,
                     lombok_jvm_arg.into_iter().collect(),

@@ -248,17 +248,14 @@ fn parse_memory_value(s: &str) -> Option<u64> {
 }
 
 pub fn build_jdtls_launch_args(
-    jdtls_path: &PathBuf,
+    jdtls_path: &Path,
+    jdtls_data_path: &Path,
     configuration: &Option<Value>,
     worktree: &Worktree,
     jvm_args: Vec<String>,
     language_server_id: &LanguageServerId,
     jdk: &mut Jdk,
 ) -> zed::Result<Vec<String>> {
-    if let Some(jdtls_launcher) = get_jdtls_launcher_from_path(worktree) {
-        return Ok(vec![jdtls_launcher]);
-    }
-
     let mut java_executable = get_java_executable(configuration, worktree, language_server_id)
         .map_err(|err| format!("Failed to locate Java executable for JDTLS: {err}"))?;
     let java_major_version = get_java_major_version(&java_executable)
@@ -283,8 +280,6 @@ pub fn build_jdtls_launch_args(
     let jar_path = find_equinox_launcher(&jdtls_base_path).map_err(|err| {
         format!("Failed to find JDTLS equinox launcher in {jdtls_base_path:?}: {err}")
     })?;
-    let jdtls_data_path = get_jdtls_data_path(configuration, worktree)
-        .map_err(|err| format!("Failed to determine JDTLS data path: {err}"))?;
 
     let mut args = vec![
         path_to_string(java_executable)?,
@@ -327,7 +322,7 @@ pub fn build_jdtls_launch_args(
     ]);
     args.extend(jvm_args);
     args.extend(vec!["-jar".to_string(), path_to_string(jar_path)?]);
-    append_jdtls_data_args(&mut args, &jdtls_data_path)?;
+    append_jdtls_data_args(&mut args, jdtls_data_path)?;
     if java_major_version >= 24 {
         args.push("-Djdk.xml.maxGeneralEntitySizeLimit=0".to_string());
         args.push("-Djdk.xml.totalEntitySizeLimit=0".to_string());
@@ -491,11 +486,10 @@ pub fn get_configured_jdtls_data_path(
     configuration: &Option<Value>,
     worktree: &Worktree,
 ) -> zed::Result<Option<PathBuf>> {
-    Ok(
-        get_jdtls_data_directory(configuration, worktree)?.map(|base_directory| {
-            build_jdtls_data_path(Path::new(&base_directory), &worktree.root_path())
-        }),
-    )
+    let base_directory = get_jdtls_data_directory(configuration, worktree)?;
+    Ok(base_directory.map(|base_directory| {
+        build_jdtls_data_path(Path::new(&base_directory), &worktree.root_path())
+    }))
 }
 
 pub fn append_jdtls_data_args(args: &mut Vec<String>, data_path: &Path) -> zed::Result<()> {
@@ -504,11 +498,7 @@ pub fn append_jdtls_data_args(args: &mut Vec<String>, data_path: &Path) -> zed::
     Ok(())
 }
 
-fn get_jdtls_data_path(configuration: &Option<Value>, worktree: &Worktree) -> zed::Result<PathBuf> {
-    if let Some(data_path) = get_configured_jdtls_data_path(configuration, worktree)? {
-        return Ok(data_path);
-    }
-
+pub fn get_default_jdtls_data_path(worktree: &Worktree) -> zed::Result<PathBuf> {
     let env = worktree.shell_env();
     let base_cachedir = match current_platform().0 {
         Os::Mac => env
